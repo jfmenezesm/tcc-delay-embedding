@@ -1,0 +1,1459 @@
+---
+title: "Resultados"
+---
+
+```{r}
+
+```
+
+------------------------------------------------------------------------
+
+format: html editor: visual ---
+
+# Bibliotecas
+
+```{r}
+require(here)
+require(dplyr)
+require(tidyverse)
+require(ggplot2)
+require(lmtest)
+require(forecast)
+require(astsa)
+library(kableExtra)
+require(nonlinearTseries)
+```
+
+# Funções
+
+```{r}
+auto_sarima <- function(serie, grade_p = 8:14) {
+  
+  resultados_validos <- list()
+  contador <- 1
+  total_testados <- 0
+  
+  n <- length(serie)
+  limite_acf <- 1.96 / sqrt(n)
+  
+  for(p in grade_p){
+    for(q in 0:3){
+      for(P in 0:2){
+        for(Q in 0:2){
+          for(d in 0:1){
+            for(D in 0:1){
+              
+              # evita modelo totalmente vazio
+              if(p + q + P + Q == 0) next
+             
+               total_testados <- total_testados + 1
+              
+               fit <- try(
+                sarima(serie,
+                       p = p, d = d, q = q,
+                       P = P, D = D, Q = Q,
+                       S = 12, details = FALSE),
+                silent = TRUE
+              )
+              
+              if(inherits(fit, "try-error")) next
+              
+              res <- residuals(fit$fit)
+              
+              # -------------------
+              # TESTE ACF
+              # -------------------
+              acf_obj <- acf(res, plot = FALSE, lag.max = 24)
+              acf_vals <- acf_obj$acf[-1]
+              
+              acf_ok <- all(abs(acf_vals) < limite_acf)
+              if(!acf_ok) next
+              
+              # -------------------
+              # TESTE LJUNG-BOX
+              # -------------------
+              box_test <- Box.test(res, lag = 24, type = "Ljung-Box")
+              
+              if(box_test$p.value <= 0.05) next
+              
+              # -------------------
+              # SALVAR TUDO
+              # -------------------
+              
+              resultados_validos[[contador]] <- list(
+                
+                # parâmetros
+                p = p, d = d, q = q,
+                P = P, D = D, Q = Q,
+                
+                # métricas
+                AIC = fit$fit$aic,
+                
+                # testes
+                ljung_box_pvalue = box_test$p.value,
+                acf_ok = TRUE,
+      
+                
+                # objeto completo (pesado, mas útil)
+                modelo = list(fit = list(arma = fit$fit$arma,
+                                         var.coef = fit$fit$var.coef,
+                                         coef = fit$fit$coef))
+              )
+              
+              contador <- contador + 1
+            }
+          }
+        }
+      }
+    }
+  }
+  
+
+  
+  if(length(resultados_validos) == 0){
+    cat("Nenhum modelo passou nos critérios.\n")
+    return(NULL)
+  }
+  
+  cat("Total de modelos válidos:", length(resultados_validos), "\n")
+  cat("Percenhtual Modelos válidos:", (length(resultados_validos)/total_testados)*100, "%\n")
+  cat("Total de Modelos Testados:", total_testados,"\n")
+  
+  return(resultados_validos)
+}
+```
+
+```{r}
+# Real_ref: valores reais da janela usada para ESCOLHER o modelo (validação).
+metricas_erro_modelos_validos <- function(serie, lista_modelos, Real_ref){
+  
+  H <- length(Real_ref)
+  qtd_modelos <- length(lista_modelos)
+  
+  resultados_metricas <- vector("list", qtd_modelos)
+  eqmps <- rep(NA, qtd_modelos)
+  
+  for (i in 1:qtd_modelos){
+    
+    mod <- lista_modelos[[i]]$modelo
+    
+    params <- mod$fit$arma
+    p <- params[1]
+    q <- params[2]
+    P <- params[3]
+    Q <- params[4]
+    S <- params[5]
+    d <- params[6]
+    D <- params[7]
+    
+
+    # Teste de coeficientes significantes
+    vcov_mat <- mod$fit$var.coef
+    
+    if(any(is.na(vcov_mat)) || any(diag(vcov_mat) <= 0)){
+      fixed <- rep(NA, length(mod$fit$coef))
+    } else {
+      se   <- sqrt(diag(vcov_mat))
+      coef <- mod$fit$coef
+      
+      tval <- coef / se
+      pval <- 2 * (1 - pnorm(abs(tval)))
+      
+      fixed <- ifelse(pval > 0.05, 0, NA)
+    }
+    
+    #Previsao
+    
+    # Predição de 1 passo: ajusta com 'serie' (coeficientes estimados uma vez) e aplica o
+    # modelo à série estimação + validação, SEM reestimar.
+    previsao <- try({
+      ajuste <- sarima(serie, p = p, d = d, q = q, P = P, D = D, Q = Q, S = S,
+                       fixed = fixed, details = FALSE)
+      x_all <- ts(c(as.numeric(serie), as.numeric(Real_ref)),
+                  start = start(serie), frequency = 12)
+      n_all <- length(x_all)
+      xr <- NULL; im <- FALSE
+      if (d == 0 && D == 0) {
+        xr <- rep(1, n_all)
+      } else if (xor(d == 1, D == 1)) {
+        xr <- 1:n_all
+      } else im <- TRUE
+      filtro <- stats::arima(x_all, order = c(p, d, q),
+                             seasonal = list(order = c(P, D, Q), period = S),
+                             xreg = xr, include.mean = im,
+                             fixed = as.numeric(coef(ajuste$fit)), transform.pars = FALSE)
+      list(pred = (as.numeric(x_all) - as.numeric(residuals(filtro)))[(length(serie) + 1):n_all])
+    }, silent = TRUE)
+    
+    if(inherits(previsao, "try-error")) {
+      eqmps[i] <- NA
+      
+      resultados_metricas[[i]] <- list(
+        ordem = c(p,d,q,P,D,Q),
+        S = S,
+        fixed = fixed,
+        EQMP = NA
+      )
+      
+      next
+    }
+    
+    # metricas de erro
+    
+    pred <- previsao$pred
+    
+    EQMP <- mean((Real_ref - pred)^2)
+    
+    eqmps[i] <- EQMP
+    
+    resultados_metricas[[i]] <- list(
+      ordem = c(p,d,q,P,D,Q),
+      S = S,
+      fixed = fixed,
+      EQMP = EQMP
+    )
+  }
+  
+  
+  validos <- which(!is.na(eqmps))
+  
+  if(length(validos) == 0){
+    cat("Nenhum modelo conseguiu gerar EQMP válido.\n")
+    
+    return(list(
+      todos_resultados = resultados_metricas,
+      eqmps = eqmps,
+      melhor_modelo = NULL
+    ))
+  }
+  
+
+  
+  eqmps_validos <- eqmps[validos]
+  
+  hist(eqmps_validos,
+       main = "Distribuição do EQMP dos modelos",
+       xlab = "EQMP",
+       breaks = 50)
+  
+  
+  melhor_indice <- validos[which.min(eqmps_validos)]
+  melhor <- resultados_metricas[[melhor_indice]]
+  
+  cat("\nMelhor modelo (menor EQMP):\n")
+  cat("p =", melhor$ordem[1],
+      "d =", melhor$ordem[2],
+      "q =", melhor$ordem[3],
+      "P =", melhor$ordem[4],
+      "D =", melhor$ordem[5],
+      "Q =", melhor$ordem[6],
+      "S =", melhor$S, "\n")
+  
+  cat("EQMP =", melhor$EQMP, "\n")
+  
+  cat("\nResumo:\n")
+  cat("Total modelos:", qtd_modelos, "\n")
+  cat("Modelos válidos:", length(validos), "\n")
+  
+  return(list(
+    todos_resultados = resultados_metricas,
+    eqmps = eqmps,
+    melhor_modelo = melhor,
+    melhor_indice = melhor_indice
+  ))
+}
+```
+
+# Preparação Série Real
+
+```{r}
+consumo_energia <- readRDS("consumo_energia.rds")
+
+```
+
+```{r}
+# Criação da Série Temporal
+Residencial <- ts(consumo_energia$Residencial, start = c(2005, 1),frequency = 12)
+
+
+consumo_energia <- consumo_energia %>%
+  mutate(Residencial_diff = c(0, diff(Residencial)))
+
+Residencial_diff <- ts(consumo_energia$Residencial_diff, start = c(2005, 1),frequency = 12)
+```
+
+```{r}
+# Especificações para Previsões ==========================================================
+
+H=12
+n=length(Residencial)-H 
+Residencial_treino = ts(Residencial[1:n],start=2005,frequency=12)	
+
+Real <- Residencial[(n+1):(n+H)] 
+
+# Janelas para a ESCOLHA do SARIMA: estimação + validação (o teste não entra)
+n_val <- 12
+n_est <- n - n_val
+Residencial_est <- ts(Residencial[1:n_est], start = 2005, frequency = 12)
+Real_val <- Residencial[(n_est + 1):n]
+cat("Estimação:", length(Residencial_est), " Validação:", length(Real_val),
+    " Teste:", length(Real), "\n")
+```
+
+# Resultados
+
+```{r}
+## PLOT da série Real
+grafico_final <- ggplot(consumo_energia, aes(x = Data, y = Residencial)) +
+  geom_line() +
+  labs(
+   
+    x = "Ano",
+    y = "Consumo (GWh)"
+  ) +
+  theme_minimal()
+grafico_final
+
+ggsave(
+  filename = here("figuras", "serie_real.png"),
+  plot = grafico_final,
+  width = 14,
+  height = 8,
+  dpi = 300
+)
+```
+
+## ARIMA
+
+### Escolha do Modelo
+
+```{r}
+pdf(
+  here("figuras","acf_pacf_sem_diferenciacao.pdf"),
+  width = 12,
+  height = 5
+)
+
+par(mfrow=c(1,2))
+
+acf(Residencial, lag.max=60, main="ACF da Série")
+pacf(Residencial, lag.max=60, main="PACF da Série")
+
+par(mfrow=c(1,1))
+
+dev.off()
+```
+
+```{r}
+pdf(
+  here("figuras","acf_pacf_diferenciada.pdf"),
+  width = 12,
+  height = 5
+)
+
+par(mfrow=c(1,2))
+
+acf(Residencial_diff, lag.max=60, main="ACF da Série Diferenciada")
+pacf(Residencial_diff, lag.max=60, main="PACF da Série Diferenciada")
+
+par(mfrow=c(1,1))
+
+dev.off()
+```
+
+```{r}
+# ACF E PACF
+acf(Residencial, lag.max = 60, main = "ACF da Série ")
+pacf(Residencial, lag.max = 60, main = "PACF da Série ")
+
+
+# ACF E PACF COM DIFERENCIACAO
+acf(Residencial_diff, lag.max = 60, main = "ACF da Série Diferenciada")
+pacf(Residencial_diff, lag.max = 60, main = "PACF da Série Diferenciada")
+```
+
+```{r}
+M1 <- arima(Residencial_treino, order = c(1, 1, 0))
+coeftest(M1)
+AIC(M1)
+
+M2 <- arima(Residencial_treino, order = c(1, 1, 1))
+coeftest(M2)
+AIC(M2)
+
+M3 <- arima(Residencial_treino, order = c(0, 1, 1))
+coeftest(M3)
+AIC(M3)
+
+M4 <- arima(Residencial_treino, order = c(2, 1, 0))
+coeftest(M4)
+AIC(M4)
+
+modelo_arima <- M4
+
+summary(modelo_arima)
+```
+
+### Análise de Resíduos
+
+```{r}
+# Análise de Resíduos
+par(mfrow = c(2, 1))
+acf(modelo_arima$res, lag.max = 60)
+pacf(modelo_arima$res, lag.max = 60)
+Box.test(modelo_arima$res, lag = 1, type = "Ljung")
+Box.test(modelo_arima$res, lag = 3, type = "Ljung")
+Box.test(modelo_arima$res, lag = 12, type = "Ljung")
+
+hist(modelo_arima$res)
+plot(modelo_arima$res)
+shapiro.test(modelo_arima$res)
+```
+
+### Previsão
+
+```{r}
+ajuste_arima <- fitted(modelo_arima)
+previsao_arima <- forecast(modelo_arima, h = 12, level = 95)
+
+grafico_final <- autoplot(Residencial, series = "Observado") +
+
+  # Ajuste
+  autolayer(
+    ajuste_arima,
+    series = "Ajuste",
+    linewidth = 1
+  ) +
+
+  # Previsão
+  autolayer(
+    previsao_arima$mean,
+    series = "Previsão",
+    linewidth = 1
+  ) +
+
+  # Intervalo de confiança
+  geom_ribbon(
+    data = data.frame(
+      x = as.numeric(time(previsao_arima$mean)),
+      ymin = previsao_arima$lower[,1],
+      ymax = previsao_arima$upper[,1]
+    ),
+    aes(x = x, ymin = ymin, ymax = ymax, fill = "IC 95%"),
+    alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+
+ # coord_cartesian(xlim = c(2023, 2026)) +
+
+  labs(
+    
+    x = "Ano",
+    y = "Consumo Residencial (GWh)",
+    color = "Séries",
+    fill = ""
+  ) +
+
+  scale_color_manual(values = c(
+    "Observado" = "black",
+    "Ajuste" = "red",
+    "Previsão" = "blue"
+  )) +
+
+  scale_fill_manual(values = c(
+    "IC 95%" = "gray10"
+  )) +
+
+  theme_minimal()+
+    theme(
+    legend.position = "bottom"
+  )
+grafico_final
+
+ggsave(
+  filename = here("figuras", "previsão_arima.png"),
+  plot = grafico_final,
+  width = 14,
+  height = 8,
+  dpi = 300
+)
+#
+#ggsave(
+#  filename = here("figuras", "previsão_arima.pdf"),
+#  plot = grafico_final,
+#  width = 14,
+#  height = 8
+#)
+```
+
+```{r}
+#previsao_arima = forecast(modelo_arima, 12, level=c(95))
+#
+#
+#autoplot(Residencial) +
+#  autolayer(previsao_arima$mean, series = "Previsão", color = "blue", linewidth = 1) +
+#  
+#  geom_ribbon(
+#    data = data.frame(
+#      x = as.numeric(time(previsao_arima$mean)),
+#      ymin = previsao_arima$lower[,1],
+#      ymax = previsao_arima$upper[,1]
+#    ),
+#    aes(x = x, ymin = ymin, ymax = ymax),
+#    fill = "gray30",
+#    alpha = 0.2,
+#    inherit.aes = FALSE   
+#  ) +
+#  
+#  coord_cartesian(xlim = c(2023, 2026)) +
+#  
+#  labs(
+#    title = "Previsão ARIMA",
+#    x = "Ano",
+#    y = "Consumo Residencial (GWh)"
+#  ) +
+#  theme_minimal()
+```
+
+## AEH
+
+### Ajuste Modelo
+
+```{r}
+AEH=HoltWinters(Residencial_treino, seasonal = "multiplicative")
+
+AEH
+```
+
+### Previsão
+
+```{r}
+ajuste_aeh <- fitted(AEH)[,1]
+
+# Previsão
+previsao_aeh <- predict(
+  AEH,
+  n.ahead = 12,
+  prediction.interval = TRUE,
+  level = 0.95,
+  interval = "prediction"
+)
+
+grafico_final <- autoplot(Residencial, series = "Observado") +
+
+  # Ajuste
+  autolayer(
+    ajuste_aeh,
+    series = "Ajuste",
+    linewidth = 1
+  ) +
+
+  # Previsão
+  autolayer(
+    previsao_aeh[, "fit"],
+    series = "Previsão",
+    linewidth = 1
+  ) +
+
+  # Intervalo de confiança
+  geom_ribbon(
+    data = data.frame(
+      x = as.numeric(time(previsao_aeh[, "fit"])),
+      ymin = previsao_aeh[, "lwr"],
+      ymax = previsao_aeh[, "upr"]
+    ),
+    aes(
+      x = x,
+      ymin = ymin,
+      ymax = ymax,
+      fill = "IC 95%"
+    ),
+    alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+
+  #coord_cartesian(xlim = c(2023, 2026)) +
+
+  labs(
+    
+    x = "Ano",
+    y = "Consumo Residencial (GWh)",
+    color = "Séries",
+    fill = ""
+  ) +
+
+  scale_color_manual(values = c(
+    "Observado" = "black",
+    "Ajuste" = "red",
+    "Previsão" = "blue"
+  )) +
+
+  scale_fill_manual(values = c(
+    "IC 95%" = "gray10"
+  )) +
+
+  theme_minimal()+
+    theme(
+    legend.position = "bottom"
+  )
+grafico_final
+
+ggsave(
+  filename = here("figuras", "previsão_aeh.png"),
+  plot = grafico_final,
+  width = 14,
+  height = 8,
+  dpi = 300
+)
+```
+
+```{r}
+#previsao_aeh = predict(AEH, n.ahead=12, prediction.interval = TRUE, level = 0.95, interval="prediction") 
+#
+#autoplot(Residencial) +
+#  autolayer(previsao_aeh[, "fit"], series = "Previsão", color = "blue", linewidth = 1) +
+#  
+#  geom_ribbon(
+#    data = data.frame(
+#      x = as.numeric(time(previsao_aeh[,"fit"])),
+#      ymin = previsao_aeh[, "upr"],
+#      ymax = previsao_aeh[, "lwr"]
+#    ),
+#    aes(x = x, ymin = ymin, ymax = ymax),
+#    fill = "gray30",
+#    alpha = 0.2,
+#    inherit.aes = FALSE   
+#  ) +
+#  
+#  coord_cartesian(xlim = c(2023, 2026)) +
+#  
+#  labs(
+#    title = "Previsão AEH Multiplicativo",
+#    x = "Ano",
+#    y = "Consumo Residencial (GWh)"
+#  ) +
+#  theme_minimal()
+```
+
+## AUTOARIMA
+
+### Ajuste Modelo
+
+```{r}
+modelo_auto_arima = auto.arima(Residencial_treino, 
+                 start.p = 0, start.q = 0, start.P = 0, start.Q = 0,
+                 d = 0, D = 0,
+                 max.d = 1, max.D = 1,
+                 max.p = 4, max.q = 4, max.P = 4, max.Q = 4,
+           seasonal = TRUE, trace = FALSE, stepwise = FALSE)# trace = TRUE pra mostrar
+coeftest(modelo_auto_arima)
+```
+
+### Previsão
+
+```{r}
+ajuste_auto_arima <- fitted(modelo_auto_arima)
+
+# Previsão
+previsao_auto_arima <- forecast(
+  modelo_auto_arima,
+  h = 12,
+  level = 95
+)
+
+grafico_final <- autoplot(Residencial, series = "Observado") +
+
+  # Ajuste
+  autolayer(
+    ajuste_auto_arima,
+    series = "Ajuste",
+    linewidth = 1
+  ) +
+
+  # Previsão
+  autolayer(
+    previsao_auto_arima$mean,
+    series = "Previsão",
+    linewidth = 1
+  ) +
+
+  # Intervalo de confiança
+  geom_ribbon(
+    data = data.frame(
+      x = as.numeric(time(previsao_auto_arima$mean)),
+      ymin = previsao_auto_arima$lower[,1],
+      ymax = previsao_auto_arima$upper[,1]
+    ),
+    aes(
+      x = x,
+      ymin = ymin,
+      ymax = ymax,
+      fill = "IC 95%"
+    ),
+    alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+
+  #coord_cartesian(xlim = c(2023, 2026)) +
+
+  labs(
+    x = "Ano",
+    y = "Consumo Residencial (GWh)",
+    color = "Séries",
+    fill = ""
+  ) +
+
+  scale_color_manual(values = c(
+    "Observado" = "black",
+    "Ajuste" = "red",
+    "Previsão" = "blue"
+  )) +
+
+  scale_fill_manual(values = c(
+    "IC 95%" = "gray30"
+  )) +
+
+  theme_minimal()+
+    theme(
+    legend.position = "bottom"
+  )
+
+grafico_final
+
+ggsave(
+  filename = here("figuras", "previsão_auto_arima.png"),
+  plot = grafico_final,
+  width = 14,
+  height = 8,
+  dpi = 300
+)
+```
+
+```{r}
+#previsao_auto_arima <- forecast(modelo_auto_arima, 12, level=c(95))
+#
+#
+#autoplot(Residencial) +
+#  autolayer(previsao_auto_arima$mean, series = "Previsão", color = "blue", linewidth = 1) +
+#  
+#  geom_ribbon(
+#    data = data.frame(
+#      x = as.numeric(time(previsao_auto_arima$mean)),
+#      ymin = previsao_auto_arima$lower[,1],
+#      ymax = previsao_auto_arima$upper[,1]
+#    ),
+#    aes(x = x, ymin = ymin, ymax = ymax),
+#    fill = "gray30",
+#    alpha = 0.2,
+#    inherit.aes = FALSE   
+#  ) +
+#  
+#  coord_cartesian(xlim = c(2023, 2026)) +
+#  
+#  labs(
+#    title = "Previsão Auto ARIMA",
+#    x = "Ano",
+#    y = "Consumo Residencial (GWh)"
+#  ) +
+#  theme_minimal()
+
+```
+
+## AUTO SARIMA
+
+### Ajustando Melhor modelo (escolha na janela de validação)
+
+A busca em grade e a escolha da ordem usam apenas a janela de estimação e a janela de validação (12 observações). O período de teste não é utilizado nessa etapa.
+
+```{r}
+dir_modelos <- here("dados", "modelos")
+dir.create(dir_modelos, recursive = TRUE, showWarnings = FALSE)
+path_modelos <- file.path(dir_modelos, "modelos_validos_val.rds")               # lista de modelos válidos (reaproveitada)
+path_ajustes <- file.path(dir_modelos, "ajuste_escolha_previsao_val_1passo.rds") # escolha por EQMP de 1 passo (nova)
+
+# 1) Modelos cujos resíduos passam nos testes (não depende do tipo de previsão)
+if (file.exists(path_modelos)) {
+  modelos_auto_sarima <- readRDS(path_modelos)
+} else {
+  modelos_auto_sarima <- auto_sarima(Residencial_est, grade_p = 8:14)
+  gc()
+  saveRDS(modelos_auto_sarima, path_modelos)
+}
+
+# 2) Entre eles, o de menor EQMP de 1 passo na janela de VALIDAÇÃO
+if (file.exists(path_ajustes)) {
+  best_modelo_auto_sarima <- readRDS(path_ajustes)
+} else {
+  best_modelo_auto_sarima <- metricas_erro_modelos_validos(
+    Residencial_est, modelos_auto_sarima, Real_val
+  )
+  saveRDS(best_modelo_auto_sarima, path_ajustes)
+}
+
+# Os 5 melhores candidatos na validação
+ord5 <- head(order(best_modelo_auto_sarima$eqmps), 5)
+print(data.frame(
+  indice = ord5,
+  ordem  = sapply(ord5, function(i)
+    paste(best_modelo_auto_sarima$todos_resultados[[i]]$ordem, collapse = ",")),
+  EQMP_validacao = best_modelo_auto_sarima$eqmps[ord5]
+))
+```
+
+### Obtendo Melhor Modelo
+
+```{r}
+fixed <-  best_modelo_auto_sarima$melhor_modelo$fixed
+ordem <-  best_modelo_auto_sarima$melhor_modelo$ordem
+p = ordem[1]
+d = ordem[2]
+q = ordem[3]
+P = ordem[4]
+D = ordem[5]
+Q = ordem[6]
+
+cat(
+  "Ordem do modelo SARIMA:\n",
+  "p =", p, "\n",
+  "d =", d, "\n",
+  "q =", q, "\n",
+  "P =", P, "\n",
+  "D =", D, "\n",
+  "Q =", Q, "\n\n",
+  "Parâmetros fixed:\n"
+)
+
+print(fixed)
+```
+
+### Previsão
+
+```{r}
+modelo_auto_sarima <- sarima(
+  Residencial_treino,
+  p = p, d = d, q = q,
+  P = P, D = D, Q = Q,
+  S = 12,
+  fixed = fixed,
+  details = FALSE
+)
+
+
+ajuste_auto_sarima <- Residencial_treino - residuals(modelo_auto_sarima$fit)
+
+# Previsão
+pdf(NULL)
+
+previsao_auto_sarima <- sarima.for(
+  Residencial_treino,
+  n.ahead = 12,
+  p = p, d = d, q = q,
+  P = P, D = D, Q = Q,
+  S = 12,
+  fixed = fixed
+)
+
+dev.off()
+
+# IC 95%
+ic_inf <- previsao_auto_sarima$pred - 1.96 * previsao_auto_sarima$se
+ic_sup <- previsao_auto_sarima$pred + 1.96 * previsao_auto_sarima$se
+
+# Gráfico
+grafico_final <- autoplot(Residencial, series = "Observado") +
+
+  # Ajuste
+  autolayer(
+    ajuste_auto_sarima,
+    series = "Ajuste",
+    linewidth = 1
+  ) +
+
+  # Previsão
+  autolayer(
+    previsao_auto_sarima$pred,
+    series = "Previsão",
+    linewidth = 1
+  ) +
+
+  # Intervalo de confiança
+  geom_ribbon(
+    data = data.frame(
+      x = as.numeric(time(previsao_auto_sarima$pred)),
+      ymin = ic_inf,
+      ymax = ic_sup
+    ),
+    aes(
+      x = x,
+      ymin = ymin,
+      ymax = ymax,
+      fill = "IC 95%"
+    ),
+    alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+
+  #coord_cartesian(xlim = c(2023, 2026)) +
+
+  labs(
+   
+    x = "Ano",
+    y = "Consumo Residencial (GWh)",
+    color = "Séries",
+    fill = ""
+  ) +
+
+  scale_color_manual(values = c(
+    "Observado" = "black",
+    "Ajuste" = "red",
+    "Previsão" = "blue"
+  )) +
+
+  scale_fill_manual(values = c(
+    "IC 95%" = "gray10"
+  )) +
+
+  theme_minimal()+
+    theme(
+    legend.position = "bottom"
+  )
+
+grafico_final
+
+ggsave(
+  filename = here("figuras", "previsão_auto_sarima.png"),
+  plot = grafico_final,
+  width = 14,
+  height = 8,
+  dpi = 300
+)
+```
+
+```{r}
+#pdf(NULL) 
+#previsao_auto_sarima <-  sarima.for(Residencial_treino, n.ahead = 12,
+#                        p = p, d = d, q = q, 
+#                        P = P, D = D, Q = Q, S = 12, 
+#                        fixed = fixed)
+#dev.off()
+#
+#
+#ic_inf <- previsao_auto_sarima$pred - 1.96*previsao_auto_sarima$se 
+#ic_sup <- previsao_auto_sarima$pred + 1.96*previsao_auto_sarima$se  
+#
+#autoplot(Residencial) +
+#  autolayer(previsao_auto_sarima$pred, series = "Previsão", color = "blue", linewidth = 1) +
+#  
+#  geom_ribbon(
+#    data = data.frame(
+#      x = as.numeric(time(previsao_auto_sarima$pred)),
+#      ymin = ic_inf,
+#      ymax = ic_sup
+#    ),
+#    aes(x = x, ymin = ymin, ymax = ymax),
+#    fill = "gray30",
+#    alpha = 0.2,
+#    inherit.aes = FALSE   
+#  ) +
+#  
+#  coord_cartesian(xlim = c(2023, 2026)) +
+#  
+#  labs(
+#    title = "Previsão Auto SARIMA",
+#    x = "Ano",
+#    y = "Consumo Residencial (GWh)"
+#  ) +
+#  theme_minimal()
+```
+
+## BOOSTING BAYESIANO
+
+### Escolha de dimensões e Lags
+
+```{r}
+old.par = par(mfrow = c(1, 2))
+# tau_delay  Responde depois de quantos lags a série começa a trazer informação nova
+
+
+tau.acf = timeLag(Residencial_treino, technique = "acf",
+                  lag.max = 100, do.plot = T)
+# tau-delay estimation based on the mutual information function linear and non linear
+tau.ami = timeLag(Residencial_treino, technique = "ami", 
+                  lag.max = 100, do.plot = T)
+
+par(old.par)
+
+tau.acf
+tau.ami
+```
+
+```{r}
+# Estima a dimensão ideal dos embeedings
+emb.dim = estimateEmbeddingDim(Residencial_treino, time.lag = 17,
+                               max.embedding.dim = 13)
+emb.dim
+```
+
+```{r}
+# primeira coluna é o y, xlag_17 xlag_43, xlag_51, xlag_68
+
+# d = 5 e lag = 3 foi o melhor
+# d = 25 e lag = 1 muito bom tb
+m <- 36
+lag <- 1
+y_ts <-  rev(Residencial_treino)
+
+tak = buildTakens(y_ts, embedding.dim = m, time.lag = lag)
+tak2 = tak[NROW(tak):1, NCOL(tak):1]
+```
+
+```{r}
+matriz_treino <- as.matrix(tak2)
+
+serie_completa <- c(Residencial_treino, Real)
+
+indice_y <- length(Residencial_treino) + 1
+
+indices_x <- indice_y - seq(lag, by = lag, length.out = m - 1)
+
+indices_x <- indices_x[length(indices_x):1]
+
+x_test <- serie_completa[indices_x]
+
+y_test <- serie_completa[indice_y]
+
+matriz_teste <- matrix(
+  c(x_test, y_test),
+  nrow = 1
+)
+
+```
+
+`{# {r} # write.table(matriz_treino, "C:/Users/Administrador/OneDrive/Faculdade/Monografia/Dissertacao_Jeff/Dissertacao_Mestrado/datasets/Energia/train1_lag1_v2.txt",  #             row.names = FALSE, col.names = FALSE, sep = " ") #  #  # write.table(matriz_teste, "C:/Users/Administrador/OneDrive/Faculdade/Monografia/Dissertacao_Jeff/Dissertacao_Mestrado/datasets/Energia/test1_lag1_v2.txt",  #             row.names = FALSE, col.names = FALSE, sep = " ")`
+
+### Verificando Ajuste no Treino
+
+```{r}
+path_ajuste <- here("Ajuste_Treino_energia_lag1_m35.csv")
+
+ajuste_treino <- read.csv(path_ajuste)
+```
+
+### Verificação das Posterioris
+
+```{r}
+path_posterioris <- here("Previsao_energia_lag1_m35.csv")
+
+consumo_posterioris <- read.csv(path_posterioris)
+```
+
+```{r}
+
+for (i in 1:12) {
+  
+  col_yhat <- paste0("yhat_", i)
+  
+  p <- ggplot(consumo_posterioris, aes(x = .data[[col_yhat]])) +
+    geom_density(fill = "blue", alpha = 0.3) +
+    geom_vline(xintercept = Real[i], color = "red", size = 0.6) +
+    facet_grid(num_exp ~ stage_idx) +
+    theme_minimal() +
+    labs(
+      title = paste0("Posteriori previsão t+", i),
+      x = col_yhat
+    )
+  
+  print(p)
+}
+```
+
+```{r}
+posteriori_final <- consumo_posterioris %>% 
+  filter(num_exp == 1) %>% 
+  filter(stage_idx == 3)
+```
+
+```{r}
+for (i in 1:12) {
+  
+  col_yhat <- paste0("yhat_", i)
+  col_inf  <- paste0("ic_inf_", i)
+  col_sup  <- paste0("ic_sup_", i)
+  col_real  <- paste0("real_", i)
+  col_media <- paste0("media_", i)
+  
+  posteriori_final <- posteriori_final %>% 
+    mutate(
+      !!col_inf := quantile(.data[[col_yhat]], 0.025),
+      !!col_sup := quantile(.data[[col_yhat]], 0.975),
+      !!col_real := Real[i],
+      !!col_media := mean(.data[[col_yhat]])
+    )
+}
+
+
+resultado_final <- tibble(
+  horizonte = 1:12,
+  
+  ic_inf = sapply(1:12, function(i)
+    quantile(posteriori_final[[paste0("yhat_", i)]], 0.025)
+  ),
+  
+  ic_sup = sapply(1:12, function(i)
+    quantile(posteriori_final[[paste0("yhat_", i)]], 0.975)
+  ),
+  
+  media = sapply(1:12, function(i)
+    mean(posteriori_final[[paste0("yhat_", i)]])
+  ),
+  
+  real = Real
+)
+
+
+path_salvamento <-  here("previsoes_posterioris_energia_lag1_m35.rds")
+saveRDS(resultado_final, file = path_salvamento)
+```
+
+#### Pegando Dataframe das Previsões
+
+```{r}
+path_posterioris <- here("previsoes_posterioris_energia_lag1_m35.rds")
+
+posterioris_df <- readRDS(path_posterioris) 
+```
+
+#### Previsão
+
+```{r}
+# série ajustada no treino
+ajuste_treino_cadeia1 <- ajuste_treino %>%
+  filter(cadeia == 1)
+inicio <- time(Residencial_treino)[1] + ( ((m-1)*lag) / frequency(Residencial_treino))
+ajuste_ts_cadeia1 <- ts(
+  ajuste_treino_cadeia1$predito,
+  start = inicio,
+  frequency = 12
+)
+
+ajuste_treino_cadeia2 <- ajuste_treino %>%
+  filter(cadeia == 2)
+
+ajuste_ts_cadeia2 <- ts(
+  ajuste_treino_cadeia2$predito,
+  start = inicio,
+  frequency = 12
+)
+
+# previsão futura
+previsao_boosting_bayes <- ts(
+  posterioris_df$media,
+  start = end(Residencial_treino) + c(0,1),
+  frequency = 12
+)
+
+# intervalo de credibilidade
+df_ic <- data.frame(
+  x = time(previsao_boosting_bayes),
+  ymin = posterioris_df$ic_inf,
+  ymax = posterioris_df$ic_sup
+)
+
+# gráfico
+grafico_final <- autoplot(
+  Residencial,
+  series = "Observado"
+) +
+
+  # ajuste cadeia 1
+  autolayer(
+    ajuste_ts_cadeia1,
+    series = "Ajuste - Cadeia 1",
+    linewidth = 1
+  ) +
+
+  # ajuste cadeia 2
+  autolayer(
+    ajuste_ts_cadeia2,
+    series = "Ajuste - Cadeia 2",
+    linewidth = 1
+  ) +
+
+  # previsão
+  autolayer(
+    previsao_boosting_bayes,
+    series = "Previsão",
+    linewidth = 1
+  ) +
+
+  # intervalo de credibilidade
+  geom_ribbon(
+    data = df_ic,
+    aes(
+      x = x,
+      ymin = ymin,
+      ymax = ymax,
+      fill = "IC 95%"
+    ),
+    alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+
+  coord_cartesian(xlim = c(2005, 2026)) +
+
+  labs(
+    
+    x = "Ano",
+    y = "Consumo Residencial (GWh)",
+    color = "Séries",
+    fill = ""
+  ) +
+
+  scale_color_manual(values = c(
+    "Observado" = "black",
+    "Ajuste - Cadeia 1" = "red",
+    "Ajuste - Cadeia 2" = "orange",
+    "Previsão" = "blue"
+  )) +
+
+  scale_fill_manual(values = c(
+    "IC 95%" = "gray10"
+  )) +
+
+  theme_minimal()+
+    theme(
+    legend.position = "bottom"
+  )
+
+# exibir
+grafico_final
+
+ggsave(
+  filename = here("figuras", "previsão_boosting_bayes.png"),
+  plot = grafico_final,
+  width = 14,
+  height = 8,
+  dpi = 300
+)
+
+```
+
+```{r}
+#previsao_boosting_bayes <- ts(
+#  posterioris_df$media,
+#  start = end(Residencial_treino) + c(0,1),
+#  frequency = 12
+#)
+#
+#df_ic <- data.frame(
+#  x = time(previsao_boosting_bayes),
+#  ymin = posterioris_df$ic_inf,
+#  ymax = posterioris_df$ic_sup
+#)
+#
+#
+#autoplot(Residencial) +
+#  
+#  autolayer(previsao_boosting_bayes, series = "Previsão", color = "blue", linewidth = 1) +
+#
+#  geom_ribbon(
+#    data = df_ic,
+#    aes(x = x, ymin = ymin, ymax = ymax),
+#    fill = "gray30",
+#    alpha = 0.2,
+#    inherit.aes = FALSE
+#  ) +
+#  
+#  coord_cartesian(xlim = c(2023, 2026)) +
+#  
+#  labs(
+#    title = "Previsão Boosting Bayesiano vs Real",
+#    x = "Ano",
+#    y = "Consumo Residencial (GWh)"
+#  ) +
+#  
+#  theme_minimal()
+```
+
+## Comparações
+
+```{r}
+datas_futuro <- time(ts(
+  Real,
+  start = end(Residencial_treino) + c(0,1),
+  frequency = 12
+))
+
+tabela_previsoes <- data.frame(
+  Data = as.yearmon(datas_futuro),
+  
+  Real = as.numeric(Real),
+  
+  Auto_ARIMA = as.numeric(previsao_auto_arima$mean),
+  Auto_SARIMA = as.numeric(previsao_auto_sarima$pred),
+  ARIMA = as.numeric(previsao_arima$mean),
+  AEH = as.numeric(previsao_aeh[, "fit"]),
+  
+  Boosting_Bayesiano = posterioris_df$media
+)
+
+tabela_previsoes <- tabela_previsoes %>%
+  mutate(across(-Data, ~ round(.x, 2)))
+
+kable(tabela_previsoes, caption = "Comparação de Previsões") %>%
+  kable_styling(
+    full_width = FALSE,
+    position = "center",
+    bootstrap_options = c("striped", "hover", "condensed")
+  )
+```
+
+```{r}
+tabela_previsoes_formatada <- tabela_previsoes %>%
+  mutate(
+    Data = format(Data, "%b/%Y")
+  )
+
+tabela_resultados <-
+  kable(
+    tabela_previsoes_formatada,
+    
+    align = "c",
+    booktabs = TRUE,
+    digits = 2
+  ) %>%
+
+  kable_styling(
+    bootstrap_options = c(
+      "striped",
+      "hover",
+      "condensed",
+      "responsive"
+    ),
+    full_width = FALSE,
+    position = "center",
+    font_size = 12
+  ) %>%
+
+  row_spec(0,
+           bold = TRUE,
+           color = "white",
+           background = "#2C3E50") %>%
+
+  column_spec(1, bold = TRUE, color = "#2C3E50")
+
+tabela_resultados
+```
+
+```{r}
+# Fazer tabela dos EQMPS
+EQMP_auto_sarima <-  sum((Real - previsao_auto_sarima$pred)^2)/12
+
+EQMP_auto_arima <-  sum((Real - previsao_auto_arima$mean)^2)/12
+
+EQMP_arima <-  sum((Real - previsao_arima$mean)^2)/12
+
+EQMP_aeh <- sum((Real - previsao_aeh[,"fit"])^2)/H
+
+EQMP_boosting_bayesiano <- sum((Real - posterioris_df$media)^2)/H
+
+tabela_eqmp <- data.frame(
+  Modelo = c("Auto ARIMA", "Auto SARIMA", "ARIMA", "AEH", "Boosting Bayesiano"),
+  EQMP = c(EQMP_auto_arima, EQMP_auto_sarima, EQMP_arima, EQMP_aeh, EQMP_boosting_bayesiano)
+)
+
+tabela_eqmp_formatada <- tabela_eqmp %>%
+  mutate(EQMP_num = round(EQMP, 2)) %>% # Mantém numérico para busca do mín
+  mutate(
+    EQMP = ifelse(EQMP_num == min(EQMP_num), 
+                  paste0("**", EQMP_num, "**"), 
+                  as.character(EQMP_num))
+  ) %>%
+  select(Modelo, EQMP)
+
+# 3. Renderiza a tabela com o mesmo estilo
+kable(tabela_eqmp_formatada, 
+      caption = "Comparação de Erro Quadrático Médio (EQMP)", 
+      escape = FALSE,
+      align = "lc") %>%
+  kable_styling(
+    full_width = FALSE,
+    position = "center",
+    bootstrap_options = c("striped", "hover", "condensed")
+  )
+```
+
+```{r}
+tabela_eqmp_formatada <- tabela_eqmp %>%
+  mutate(
+    EQMP = round(EQMP, 2),
+    
+    Melhor = EQMP == min(EQMP)
+  )
+
+tabela_eqmp_final <-
+
+kable(
+  tabela_eqmp_formatada %>%
+    select(Modelo, EQMP),
+  
+ 
+  
+  align = c("l","c"),
+  
+  booktabs = TRUE
+) %>%
+
+kable_styling(
+  bootstrap_options = c(
+    "striped",
+    "hover",
+    "condensed",
+    "responsive"
+  ),
+  
+  full_width = FALSE,
+  
+  position = "center",
+  
+  font_size = 12
+) %>%
+
+row_spec(
+  0,
+  
+  bold = TRUE,
+  
+  color = "white",
+  
+  background = "#2C3E50"
+) %>%
+
+column_spec(
+  1,
+  
+  bold = TRUE,
+  
+  color = "#2C3E50"
+) %>%
+
+row_spec(
+  which(tabela_eqmp_formatada$Melhor),
+  
+  bold = TRUE,
+  
+  color = "white",
+  
+  background = "#27AE60"
+) 
+
+tabela_eqmp_final
+```
+
+```{r}
+save_kable(
+  tabela_eqmp_final,
+  file = here("figuras","tabela_eqmp.png"),
+  density = 1200
+)
+```

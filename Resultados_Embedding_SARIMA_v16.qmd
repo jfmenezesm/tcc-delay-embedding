@@ -1,0 +1,2722 @@
+---
+title: "Resultados — Série Real de Consumo de Energia (v16, 1 passo, EQMP%, FAC dos resíduos, HTML autocontido)"
+subtitle: "SARIMA vs. Regressão por Delay Embedding"
+format:
+  html:
+    embed-resources: true
+editor: visual
+---
+
+# Bibliotecas
+
+```{r}
+#| message: false
+#| warning: false
+
+library(here)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(forecast)
+library(astsa)
+library(lmtest)
+library(nonlinearTseries)
+library(zoo)
+library(glmnet)   # LASSO
+
+# Pasta de saída para as figuras do capítulo de Resultados
+dir_figuras <- here("figuras", "resultados_preliminares")
+if (!dir.exists(dir_figuras)) dir.create(dir_figuras, recursive = TRUE)
+
+cat("Rodada iniciada em:", format(Sys.time()), "\n")
+cat("Pasta de saída:", normalizePath(dir_figuras, mustWork = FALSE), "\n")
+```
+
+------------------------------------------------------------------------
+
+# Preparação da Série Temporal
+
+```{r}
+consumo_energia <- readRDS("consumo_energia.rds")
+
+# Série completa
+Residencial <- ts(
+  consumo_energia$Residencial,
+  start     = c(2005, 1),
+  frequency = 12
+)
+
+# Partição treino / teste
+H                  <- 12
+n                  <- length(Residencial) - H
+Residencial_treino <- ts(Residencial[1:n], start = c(2005, 1), frequency = 12)
+teste               <- as.numeric(Residencial[(n + 1):(n + H)])
+
+cat("Período de treino:", format(start(Residencial_treino)), "a",
+    format(end(Residencial_treino)), "\n")
+cat("Horizonte de previsão: fev/2025 a jan/2026 (H =", H, ")\n")
+cat("N (treino):", n, "observações\n")
+```
+
+------------------------------------------------------------------------
+
+# Análise Exploratória
+
+```{r}
+#| fig-width: 12
+#| fig-height: 4
+
+grafico_serie <- autoplot(Residencial) +
+  labs(x = "Ano", y = "Consumo Residencial (GWh)") +
+  theme_minimal()
+
+grafico_serie
+
+ggsave(file.path(dir_figuras, "01_serie_completa.png"),
+       grafico_serie, width = 12, height = 4, dpi = 300)
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 5
+
+png(file.path(dir_figuras, "02_acf_pacf_original.png"),
+    width = 12, height = 5, units = "in", res = 300)
+par(mfrow = c(1, 2))
+acf(Residencial_treino,  lag.max = 60, main = "FAC — Série Original")
+pacf(Residencial_treino, lag.max = 60, main = "FACP — Série Original")
+par(mfrow = c(1, 1))
+dev.off()
+
+# Exibição no documento
+par(mfrow = c(1, 2))
+acf(Residencial_treino,  lag.max = 60, main = "FAC — Série Original")
+pacf(Residencial_treino, lag.max = 60, main = "FACP — Série Original")
+par(mfrow = c(1, 1))
+```
+
+A FAC apresenta decaimento lento com picos nos múltiplos de lag 12, o que indica não-estacionariedade e sazonalidade anual. Aplica-se diferenciação sazonal ($D = 1$, $S = 12$) antes da inspeção dos resíduos.
+
+```{r}
+#| fig-width: 12
+#| fig-height: 5
+
+Residencial_diff <- diff(Residencial_treino, lag = 12)
+
+png(file.path(dir_figuras, "03_acf_pacf_diferenciada.png"),
+    width = 12, height = 5, units = "in", res = 300)
+par(mfrow = c(1, 2))
+acf(Residencial_diff,  lag.max = 60, main = "FAC — Série Diferenciada (D=1, S=12)")
+pacf(Residencial_diff, lag.max = 60, main = "FACP — Série Diferenciada (D=1, S=12)")
+par(mfrow = c(1, 1))
+dev.off()
+
+par(mfrow = c(1, 2))
+acf(Residencial_diff,  lag.max = 60, main = "FAC — Série Diferenciada (D=1, S=12)")
+pacf(Residencial_diff, lag.max = 60, main = "FACP — Série Diferenciada (D=1, S=12)")
+par(mfrow = c(1, 1))
+```
+
+------------------------------------------------------------------------
+
+# Modelo SARIMA
+
+## Estimação
+
+O modelo SARIMA de referência foi identificado por busca em grade exaustiva, conduzida em trabalho paralelo no mesmo grupo de pesquisa, testando $p \in \{8, \ldots, 14\}$, $q \in \{0,1,2,3\}$, $P, Q \in \{0,1,2\}$ e $d, D \in \{0,1\}$. Cada candidato foi ajustado sobre a janela de estimação e retido apenas se seus resíduos satisfizeram o teste de Ljung-Box ($p > 0{,}05$, lag 24) e a FAC residual esteve dentro de $\pm 1{,}96/\sqrt{n}$. Entre os 302 modelos retidos, o de menor Erro Quadrático Médio de Previsão (EQMP) na janela de **validação** foi o SARIMA$(11, 0, 2)(0, 1, 2)_{12}$, com coeficientes não significativos ($p > 0{,}05$) fixados em zero \citep{box1970, box2015, shumway2017}.
+
+```{r}
+# SARIMA escolhido pela busca de 1 passo (arquivo gerado pelo código do Nicolas v4).
+# Se o arquivo não existir, usa-se o SARIMA(11,0,2)(0,1,2) anterior.
+arq_novo <- here("dados", "modelos", "ajuste_escolha_previsao_val_1passo.rds")
+if (file.exists(arq_novo)) {
+  mel <- readRDS(arq_novo)$melhor_modelo
+  ordem <- as.numeric(mel$ordem)            # p, d, q, P, D, Q
+  fixed_sarima <- mel$fixed                 # NA = livre; 0 = fixado em zero
+  cat("SARIMA da busca de 1 passo: (", paste(ordem[1:3], collapse = ","), ")(",
+      paste(ordem[4:6], collapse = ","), ")[12]\n", sep = "")
+} else {
+  ordem <- c(11, 0, 2, 0, 1, 2)
+  fixed_sarima <- c(ar1 = NA, ar2 = 0, ar3 = NA, ar4 = NA, ar5 = 0, ar6 = 0, ar7 = 0,
+                    ar8 = 0, ar9 = NA, ar10 = 0, ar11 = 0, ma1 = NA, ma2 = NA,
+                    sma1 = NA, sma2 = 0, constant = NA)
+  cat("Arquivo da busca de 1 passo não encontrado: usando o SARIMA anterior.\n")
+}
+
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+
+png(file.path(dir_figuras, "04_sarima_diagnostico.png"),
+    width = 12, height = 8, units = "in", res = 300)
+ajuste_sarima <- sarima(
+  Residencial_treino,
+  p = ordem[1], d = ordem[2], q = ordem[3],
+  P = ordem[4], D = ordem[5], Q = ordem[6],
+  S = 12,
+  fixed = fixed_sarima
+)
+dev.off()
+
+modelo_sarima <- ajuste_sarima$fit
+
+cat("Modelo SARIMA ajustado no treino, com coeficientes fixados\n")
+cat("AIC:",  ajuste_sarima$fit$aic, "\n")
+
+# Reconstrução do ajuste a partir dos resíduos (mesma lógica do Auto SARIMA)
+ajuste_sarima_serie <- Residencial_treino - residuals(modelo_sarima)
+```
+
+```{r}
+coeftest(modelo_sarima)
+```
+
+## Diagnóstico dos Resíduos
+
+O painel de diagnóstico gerado por `sarima()` (FAC dos resíduos, QQ-plot e estatística de Ljung-Box) já foi salvo no chunk de ajuste acima. Complementarmente, apresentam-se os testes formais:
+
+```{r}
+#| fig-width: 12
+#| fig-height: 5
+
+residuos_sarima <- residuals(modelo_sarima)
+
+png(file.path(dir_figuras, "05_sarima_acf_pacf_residuos.png"),
+    width = 12, height = 5, units = "in", res = 300)
+par(mfrow = c(1, 2))
+acf(residuos_sarima,  lag.max = 36, main = "FAC dos Resíduos — SARIMA(11,0,3)(0,1,1)[12]")
+pacf(residuos_sarima, lag.max = 36, main = "FACP dos Resíduos — SARIMA(11,0,3)(0,1,1)[12]")
+par(mfrow = c(1, 1))
+dev.off()
+
+par(mfrow = c(1, 2))
+acf(residuos_sarima,  lag.max = 36, main = "FAC dos Resíduos — SARIMA(11,0,3)(0,1,1)[12]")
+pacf(residuos_sarima, lag.max = 36, main = "FACP dos Resíduos — SARIMA(11,0,3)(0,1,1)[12]")
+par(mfrow = c(1, 1))
+```
+
+```{r}
+cat("=== Teste de Ljung-Box (lag = 12) ===\n")
+print(Box.test(residuos_sarima, lag = 12, type = "Ljung-Box"))
+
+cat("\n=== Teste de Ljung-Box (lag = 24) ===\n")
+print(Box.test(residuos_sarima, lag = 24, type = "Ljung-Box"))
+
+cat("\n=== Teste de Shapiro-Wilk (normalidade) ===\n")
+print(shapiro.test(residuos_sarima))
+```
+
+## Previsão
+
+```{r}
+#| fig-width: 12
+#| fig-height: 5
+
+# Predição de 1 passo: o SARIMA estimado no treino (coeficientes fixos) é aplicado à série
+# completa; cada predição usa os valores observados anteriores, sem reestimar.
+n_tr_s <- length(Residencial_treino); n_all <- length(Residencial)
+x_all  <- ts(as.numeric(Residencial), start = start(Residencial), frequency = 12)
+xr <- NULL; im <- FALSE
+if (ordem[2] == 0 && ordem[5] == 0) {
+  xr <- rep(1, n_all)
+} else if (xor(ordem[2] == 1, ordem[5] == 1)) {
+  xr <- 1:n_all
+} else im <- TRUE
+filtro_sarima <- stats::arima(
+  x_all, order = ordem[1:3], seasonal = list(order = ordem[4:6], period = 12),
+  xreg = xr, include.mean = im, fixed = as.numeric(coef(modelo_sarima)),
+  transform.pars = FALSE
+)
+pred_sarima <- (as.numeric(x_all) - as.numeric(residuals(filtro_sarima)))[(n_tr_s + 1):n_all]
+previsao_sarima <- list(pred = pred_sarima, se = rep(sqrt(modelo_sarima$sigma2), H))
+
+cat("EQMP (1 passo) — SARIMA:", round(mean((teste - pred_sarima)^2), 2), "\n")
+
+grafico_sarima <- autoplot(Residencial, series = "Observado") +
+  autolayer(ajuste_sarima_serie, series = "Ajuste",   linewidth = 0.8) +
+  autolayer(
+    ts(pred_sarima, start = end(Residencial_treino) + c(0, 1), frequency = 12),
+    series = "Previsão", linewidth = 1.0
+  ) +
+  coord_cartesian(xlim = c(2020, 2026.2)) +
+  labs(x = "Ano", y = "Consumo Residencial (GWh)", color = "Séries") +
+  scale_color_manual(values = c(
+    "Observado" = "black",
+    "Ajuste"    = "steelblue",
+    "Previsão"  = "firebrick"
+  )) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+grafico_sarima
+
+ggsave(file.path(dir_figuras, "06_sarima_previsao.png"),
+       grafico_sarima, width = 12, height = 5, dpi = 300)
+```
+
+------------------------------------------------------------------------
+
+# Modelos de Regressão por Delay Embedding
+
+## Fundamentos
+
+O modelo de regressão por \textit{delay embedding} representa $Y_t$ como função linear de suas próprias defasagens no espaço reconstruído. Nesta versão, os parâmetros $\tau$ (atraso temporal) e $m$ (dimensão do \textit{embedding}) não são fixados previamente. Ambos são selecionados por uma validação temporal com um único conjunto de validação, conforme o desenho experimental definido para esta etapa.
+
+Para uma combinação $(\tau,m)$, os preditores são $Y_{t-\tau},Y_{t-2\tau},\ldots,Y_{t-(m-1)\tau}$, e o modelo assume a forma
+
+$$Y_t = \beta_0 + \sum_{j=1}^{m-1} \beta_j \, Y_{t-j\tau} + \varepsilon_t.$$
+
+A previsão $H$ passos à frente é realizada de forma recursiva (\textit{recursive forecasting}): cada valor previsto $\hat{Y}_{n+h}$ é utilizado como entrada para obter $\hat{Y}_{n+h+1}$.
+
+A seleção de $\tau$ e $m$ é feita separadamente para a regressão por mínimos quadrados ordinários (MQO) e para o LASSO. A variante com lags significativos utiliza a combinação $(\tau,m)$ selecionada para a regressão completa e, posteriormente, aplica a seleção de lags já utilizada na versão anterior do experimento.
+
+## Construção da Matriz de Embedding
+
+```{r}
+# Função: constrói matriz de delay embedding
+# Resposta:   Y_t
+# Preditores: Y_{t-tau}, Y_{t-2*tau}, ..., Y_{t-(m-1)*tau}
+build_embedding_matrix <- function(serie, tau, m) {
+  s <- as.numeric(serie)
+  n <- length(s)
+
+  max_lag <- (m - 1) * tau
+  if (max_lag >= n) {
+    stop("A combinação tau/m exige mais histórico do que a série possui.")
+  }
+
+  inicio <- max_lag + 1
+
+  Y_resp <- s[inicio:n]
+
+  X_mat <- matrix(NA_real_, nrow = length(Y_resp), ncol = m - 1)
+
+  for (j in seq_len(m - 1)) {
+    defasagem <- j * tau
+    X_mat[, j] <- s[(inicio - defasagem):(n - defasagem)]
+  }
+
+  colnames(X_mat) <- paste0("lag_", (1:(m - 1)) * tau)
+
+  list(X = X_mat, Y = Y_resp)
+}
+```
+
+## Previsão Recursiva
+
+```{r}
+# Previsão recursiva H passos à frente para modelos LM ou LASSO.
+previsao_recursiva <- function(
+    modelo,
+    x,
+    y,
+    H,
+    tipo = c("lm", "lasso"),
+    lambda_val = NULL,
+    residuos = NULL,  # usado só nos intervalos de predição (bootstrap)
+    alvo = NULL       # valores REAIS dos H instantes previstos: se informado, a previsão é de 1 passo
+) {
+
+  ## Define o tipo de modelo
+  tipo <- match.arg(tipo)
+
+  ## Inicializacao
+  buffer <- as.numeric(y)
+  preds <- numeric(H)
+
+  ## -----------------------------------------------------------
+  ## Identificacao dos preditores e das defasagens temporais
+  ## -----------------------------------------------------------
+
+  ## Para o modelo de MQO e para o LASSO, os preditores sao obtidos
+  ## diretamente a partir da matriz do modelo.
+  
+  preditores <- x
+  
+  ## Extrai as defasagens temporais reais.
+  ##
+  ## Exemplo:
+  ## "lag_2", "lag_4", "lag_6"
+  ##        ↓
+  ## m_times_tau = 2, 4, 6
+  m_times_tau <- as.numeric(
+    sub("^lag_", "", colnames(preditores))
+  )
+
+  ## -----------------------------------------------------------
+  ## Previsao recursiva
+  ## -----------------------------------------------------------
+
+  for (h in seq_len(H)) {
+
+    n_buf <- length(buffer)
+
+    ## Posicoes no historico correspondentes aos lags
+    ## utilizados pelo modelo.
+    idx <- n_buf - m_times_tau + 1
+
+    if (any(idx < 1)) {
+      stop("Histórico insuficiente para os lags solicitados.")
+    }
+
+    ## Valores dos lags no instante atual.
+    x_vals <- buffer[idx]
+
+    ## Os nomes sao importantes para garantir que cada valor
+    ## corresponda ao preditor correto.
+    names(x_vals) <- colnames(preditores)
+
+    ## ---------------------------------------------------------
+    ## MQO
+    ## ---------------------------------------------------------
+
+    if (tipo == "lm") {
+
+      x_df <- as.data.frame(t(x_vals))
+
+      preds[h] <- predict(modelo, newdata = x_df)
+
+    }
+
+    ## ---------------------------------------------------------
+    ## LASSO
+    ## ---------------------------------------------------------
+
+    if (tipo == "lasso") {
+
+      x_mat <- matrix(
+        x_vals,
+        nrow = 1,
+        dimnames = list(NULL, colnames(preditores))
+      )
+
+      preds[h] <- as.numeric(
+        predict(
+          modelo,
+          newx = x_mat,
+          s = lambda_val
+        )
+      )[1]
+
+    }
+
+    ## Bootstrap dos residuos (intervalos de predicao): soma um erro sorteado
+    if (!is.null(residuos)) {
+      preds[h] <- preds[h] + sample(residuos, 1)
+    }
+
+    ## Adiciona ao historico: o valor REAL (previsao de 1 passo, se 'alvo' foi informado)
+    ## ou a propria previsao (previsao recursiva).
+    buffer <- c(buffer, if (!is.null(alvo)) alvo[h] else preds[h])
+
+  }
+
+  return(preds)
+}
+```
+
+## Validação temporal para seleção de $\tau$ e $m$
+
+Nesta etapa é utilizada **uma única janela temporal de validação**, e não vários folds. Os últimos $H_{\mathrm{val}}=12$ meses do conjunto de treino original são separados para validação. Os meses anteriores são usados exclusivamente para estimar cada combinação candidata de $(\tau,m)$.
+
+Assim, a seleção de hiperparâmetros ocorre antes do teste final:
+
+``` text
+Treino para seleção                 Validação             Teste final
+<-------------------------------->  <------------>       <------------>
+229 meses                          12 meses              12 meses
+jan/2005--jan/2024                 fev/2024--jan/2025    fev/2025--jan/2026
+```
+
+O conjunto de teste permanece intocado durante toda a seleção de $\tau$ e $m$.
+
+A grade considerada é:
+
+```{r}
+H_val <- 12
+
+# Grade definida para a busca de tau e m.
+grid_tau <- 1:12
+grid_m   <- seq(1, 60, by = 1)
+
+# Fator utilizado apenas como proteção contra trajetórias
+# numericamente explosivas durante a previsão recursiva.
+# Ele NÃO é um critério estatístico de seleção.
+fator_sanidade <- 3
+
+# Separação temporal:
+# Residencial_treino possui 241 observações.
+n_treino_cv <- length(Residencial_treino) - H_val
+
+serie_treino_cv <- as.numeric(
+  Residencial_treino[1:n_treino_cv]
+)
+
+serie_validacao <- as.numeric(
+  Residencial_treino[(n_treino_cv + 1):length(Residencial_treino)]
+)
+
+cat("Treino para seleção:", length(serie_treino_cv), "observações\n")
+cat("Validação:", length(serie_validacao), "observações\n")
+cat("Grade:", length(grid_tau) * length(grid_m), "combinações\n")
+```
+
+### Função de avaliação de uma combinação
+
+```{r}
+avaliar_combinacao <- function(tau, m, serie_treino, serie_validacao,
+                               fator_sanidade = 3) {
+
+  resultado <- list(
+    tau = tau,
+    m = m,
+    EQMP = Inf,
+    estavel = FALSE,
+    lambda = NA_real_,
+    motivo = NA_character_
+  )
+
+  if ((m - 1) * tau >= length(serie_treino)) {
+    resultado$motivo <- "historico_insuficiente"
+    return(resultado)
+  }
+
+  dados <- tryCatch(
+    build_embedding_matrix(serie_treino, tau, m),
+    error = function(e) NULL
+  )
+
+  if (is.null(dados)) {
+    resultado$motivo <- "falha_embedding"
+    return(resultado)
+  }
+
+  modelo <- tryCatch({
+    df <- as.data.frame(dados$X)
+    df$Y <- dados$Y
+    lm(Y ~ ., data = df)
+  }, error = function(e) NULL)
+
+  if (is.null(modelo)) {
+    resultado$motivo <- "falha_ajuste"
+    return(resultado)
+  }
+
+  preds <- tryCatch(
+    previsao_recursiva(
+      modelo = modelo,
+      x = dados$X,
+      y = serie_treino,
+      H = length(serie_validacao),
+      alvo = serie_validacao,
+      tipo = "lm"
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(preds)) {
+    resultado$motivo <- "falha_previsao"
+    return(resultado)
+  }
+
+  limite <- fator_sanidade * max(abs(serie_treino), na.rm = TRUE)
+
+  if (any(!is.finite(preds) | abs(preds) > limite | preds <= 0)) {
+    resultado$motivo <- "previsao_instavel"
+    return(resultado)
+  }
+
+  eqmp <- mean((preds - serie_validacao)^2)
+
+  if (!is.finite(eqmp)) {
+    resultado$motivo <- "eqmp_invalido"
+    return(resultado)
+  }
+
+  resultado$EQMP <- eqmp
+  resultado$estavel <- TRUE
+  resultado$motivo <- "ok"
+
+  resultado
+}
+```
+
+## Seleção para a regressão completa por MQO
+
+```{r}
+resultados_cv_emb <- vector(
+  "list",
+  length(grid_tau) * length(grid_m)
+)
+
+k <- 1
+
+for (tau_i in grid_tau) {
+  for (m_i in grid_m) {
+
+    resultados_cv_emb[[k]] <- avaliar_combinacao(
+      tau = tau_i,
+      m = m_i,
+      serie_treino = serie_treino_cv,
+      serie_validacao = serie_validacao,
+      fator_sanidade = fator_sanidade
+    )
+
+    k <- k + 1
+  }
+}
+
+tabela_cv_emb <- bind_rows(resultados_cv_emb)
+
+# Melhor combinação entre as combinações estáveis.
+tabela_validos_emb <- tabela_cv_emb %>%
+  filter(estavel, is.finite(EQMP)) %>%
+  arrange(EQMP)
+
+if (nrow(tabela_validos_emb) == 0) {
+  stop("Nenhuma combinação tau/m foi considerada estável para MQO.")
+}
+
+melhor_emb <- tabela_validos_emb[1, ]
+
+tau_emb <- melhor_emb$tau
+m_emb   <- melhor_emb$m
+
+cat("\n=== SELEÇÃO DE TAU E M — MQO ===\n")
+cat("Melhor tau:", tau_emb, "\n")
+cat("Melhor m:", m_emb, "\n")
+cat("EQMP de validação:", round(melhor_emb$EQMP, 3), "\n")
+cat("Combinações estáveis:",
+    nrow(tabela_validos_emb), "de",
+    nrow(tabela_cv_emb), "\n")
+
+knitr::kable(
+  tabela_cv_emb %>%
+    mutate(
+      EQMP = ifelse(is.finite(EQMP), round(EQMP, 3), NA_real_)
+    ),
+  caption = "Validação temporal de uma janela para seleção de $\\tau$ e $m$ — MQO",
+  booktabs = TRUE
+)
+```
+
+## Visualização da seleção de $\tau$ e $m$
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+
+grafico_cv_emb <- ggplot(
+  tabela_cv_emb,
+  aes(x = m, y = tau, fill = EQMP)
+) +
+  geom_tile(color = "white") +
+  geom_point(
+    data = tabela_cv_emb %>%
+      filter(tau == tau_emb, m == m_emb),
+    aes(x = m, y = tau),
+    shape = 21,
+    size = 5,
+    fill = NA,
+    stroke = 1.2
+  ) +
+  labs(
+    x = "Dimensão do embedding (m)",
+    y = "Atraso temporal (tau)",
+    fill = "EQMP de validação"
+  ) +
+  theme_minimal()
+
+grafico_cv_emb
+
+ggsave(
+  file.path(dir_figuras, "cv_tau_m_embedding.png"),
+  grafico_cv_emb,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+```
+
+## Variante 1 — Regressão Completa (MQO)
+
+Após a seleção de $\tau$ e $m$, a regressão completa é reestimada utilizando **todo o conjunto de treino** (241 observações). A seleção não utiliza os 12 meses do teste final.
+
+```{r}
+tau <- tau_emb
+m   <- m_emb
+
+dados_emb <- build_embedding_matrix(
+  as.numeric(Residencial_treino),
+  tau,
+  m
+)
+
+X_treino <- dados_emb$X
+Y_treino <- dados_emb$Y
+
+cat("=== Hiperparâmetros selecionados para MQO ===\n")
+cat("tau =", tau, "\n")
+cat("m   =", m, "\n")
+cat("Número de preditores =", m - 1, "\n")
+
+modelo_emb_completo <- lm(Y_treino ~ ., data = as.data.frame(X_treino))
+
+pred_emb_completo <- previsao_recursiva(
+  modelo = modelo_emb_completo,
+  x = X_treino,
+  y = Y_treino,
+  H = H,
+  alvo = teste,
+  tipo = "lm"
+)
+
+cat("=== Sumário — Embedding Completo ===\n")
+print(summary(modelo_emb_completo))
+```
+
+```{r}
+require(performance)
+require(see)
+
+VIF <- check_collinearity(modelo_emb_completo)
+VIF
+plot(VIF)
+
+mSigma <- vcov(modelo_emb_completo)
+vBeta  <- coefficients(modelo_emb_completo)
+
+t.obs <- vBeta[-1] / sqrt(diag(mSigma)[-1])
+
+t.obs
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 5
+
+res_completo <- residuals(modelo_emb_completo)
+
+png(
+  file.path(
+    dir_figuras,
+    "07_embedding_completo_acf_pacf_residuos.png"
+  ),
+  width = 12, height = 5, units = "in", res = 300
+)
+
+par(mfrow = c(1, 2))
+acf(
+  res_completo,
+  lag.max = max(36, m - 1),
+  main = "FAC dos Resíduos — Embedding Completo"
+)
+pacf(
+  res_completo,
+  lag.max = max(36, m - 1),
+  main = "FACP dos Resíduos — Embedding Completo"
+)
+par(mfrow = c(1, 1))
+dev.off()
+
+par(mfrow = c(1, 2))
+acf2(
+  res_completo,
+  max.lag = max(36, m - 1),
+  main = "FAC e FACP dos Resíduos — Embedding Completo"
+)
+par(mfrow = c(1, 1))
+
+cat("=== Teste de Ljung-Box (lag = 12) ===\n")
+print(Box.test(res_completo, lag = 12, type = "Ljung-Box"))
+
+cat("\n=== Teste de Ljung-Box (lag = 24) ===\n")
+print(Box.test(res_completo, lag = 24, type = "Ljung-Box"))
+
+cat("\n=== Teste de Shapiro-Wilk ===\n")
+print(shapiro.test(res_completo))
+```
+
+## Variante 2 — Regressão com Lags Significativos
+
+Os coeficientes da variante completa são avaliados pelo critério utilizado na versão anterior. A variante restrita utiliza os lags para os quais o valor absoluto de `t.obs` é superior a 1.96.
+
+```{r}
+coef_summary <- summary(modelo_emb_completo)$coefficients
+
+# Coeficientes NA (lags colineares) geram t.obs = NA; são descartados aqui.
+n_aliased <- sum(is.na(t.obs))
+if (n_aliased > 0) warning(n_aliased, " coeficiente(s) NA no MQO completo (lags colineares).")
+
+lags_sig <- as.integer(
+  gsub("lag_", "", names(t.obs)[which(!is.na(t.obs) & abs(t.obs) > 1.96)])
+)
+
+lags_non_sig <- as.integer(
+  gsub("lag_", "", names(t.obs)[which(!is.na(t.obs) & abs(t.obs) <= 1.96)])
+)
+
+cat("Lags significativos ao nível 5%:", lags_sig, "\n")
+cat("Total de lags selecionados:",
+    length(lags_sig), "de", m - 1, "\n")
+
+cat("Lags não significativos ao nível 5%:",
+    lags_non_sig, "\n")
+cat("Total de lags não selecionados:",
+    length(lags_non_sig), "de", m - 1, "\n")
+```
+
+```{r}
+if (length(lags_sig) == 0) {
+
+  warning(
+    "Nenhum lag significativo encontrado.
+    Revise seu código :)"
+    
+  )
+
+} else {
+
+  vars_sig <- paste0("lag_", lags_sig)
+  X_sig = X_treino[, vars_sig, drop = FALSE]
+
+  modelo_emb_sig <- lm(Y_treino ~ ., data = as.data.frame(X_sig))
+}
+
+cat("=== Sumário — Embedding com Lags Significativos ===\n")
+print(summary(modelo_emb_sig))
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 5
+
+res_sig <- residuals(modelo_emb_sig)
+
+png(
+  file.path(
+    dir_figuras,
+    "08_embedding_significativo_acf_pacf_residuos.png"
+  ),
+  width = 12, height = 5, units = "in", res = 300
+)
+
+par(mfrow = c(1, 2))
+acf(
+  res_sig,
+  lag.max = max(36, m - 1),
+  main = "FAC dos Resíduos — Lags Significativos"
+)
+pacf(
+  res_sig,
+  lag.max = max(36, m - 1),
+  main = "FACP dos Resíduos — Lags Significativos"
+)
+par(mfrow = c(1, 1))
+dev.off()
+
+par(mfrow = c(1, 2))
+acf2(
+  res_sig,
+  max.lag = max(36, m - 1),
+  main = "FAC e FACP dos Resíduos — Lags Significativos"
+)
+par(mfrow = c(1, 1))
+
+cat("=== Teste de Ljung-Box (lag = 12) ===\n")
+print(Box.test(res_sig, lag = 12, type = "Ljung-Box"))
+
+cat("\n=== Teste de Ljung-Box (lag = 24) ===\n")
+print(Box.test(res_sig, lag = 24, type = "Ljung-Box"))
+
+cat("\n=== Teste de Shapiro-Wilk ===\n")
+print(shapiro.test(res_sig))
+```
+
+```{r}
+pred_emb_sig <- previsao_recursiva(
+  modelo = modelo_emb_sig,
+  x = X_sig,
+  y = Y_treino,
+  H = H,
+  alvo = teste,
+  tipo = "lm"
+)
+```
+
+## Variante 3 — LASSO
+
+A regularização LASSO penaliza a soma dos valores absolutos dos coeficientes, permitindo que alguns lags tenham coeficiente exatamente igual a zero.
+
+Nesta etapa, a seleção é realizada para **todas as combinações** $(\tau,m)$ da grade.
+
+Para cada combinação $(\tau,m)$, o LASSO é ajustado utilizando **todos os lags do embedding completo**. Assim, nenhum filtro de significância é aplicado previamente aos preditores. A própria penalização LASSO realiza a seleção dos lags, permitindo que alguns coeficientes sejam reduzidos exatamente a zero.
+
+Para cada combinação $(\tau,m)$, o parâmetro $\lambda$ é selecionado por uma validação temporal manual. Uma trajetória de valores de $\lambda$ é gerada pelo `glmnet`, mas a escolha é feita explicitamente pelo EQMP dos 12 meses de validação. Não é utilizada a função `cv.glmnet`.
+
+### Funções auxiliares para seleção dos lags e de $\lambda$
+
+```{r}
+# Seleciona lambda manualmente para uma combinação tau,m.
+# O modelo é ajustado no treino e cada lambda é avaliado por previsão
+# recursiva dos 12 meses de validação.
+avaliar_lambdas_manual <- function(
+    X_treino, Y_treino, serie_treino, serie_validacao,
+    tau, fator_sanidade = 3,
+    nlambda = 100) {
+
+  # ------------------------------------------------------------
+  # LASSO utilizando TODOS os lags do embedding
+  # ------------------------------------------------------------
+
+  modelo_path <- glmnet::glmnet(
+    x = as.matrix(X_treino),
+    y = Y_treino,
+    alpha = 1,
+    nlambda = nlambda
+  )
+
+  lambdas <- modelo_path$lambda
+
+  resultados <- vector("list", length(lambdas))
+
+  for (i in seq_along(lambdas)) {
+
+    lambda_i <- lambdas[i]
+
+    # ----------------------------------------------------------
+    # Previsão recursiva para o lambda atual
+    # ----------------------------------------------------------
+
+    preds <- tryCatch(
+      previsao_recursiva(
+        modelo = modelo_path,
+        x = X_treino,
+        y = serie_treino,
+        H = length(serie_validacao),
+        alvo = serie_validacao,
+        tipo = "lasso",
+        lambda_val = lambda_i
+      ),
+      error = function(e) NULL
+    )
+
+    if (is.null(preds)) {
+
+      resultados[[i]] <- data.frame(
+        lambda = lambda_i,
+        EQMP = Inf,
+        estavel = FALSE,
+        motivo = "falha_previsao"
+      )
+
+      next
+    }
+
+    # ----------------------------------------------------------
+    # Proteção contra trajetórias numericamente explosivas
+    # ----------------------------------------------------------
+
+    limite <- fator_sanidade *
+      max(abs(serie_treino), na.rm = TRUE)
+
+    instavel <- any(
+      !is.finite(preds) |
+      abs(preds) > limite |
+      preds <= 0
+    )
+
+    if (instavel) {
+
+      resultados[[i]] <- data.frame(
+        lambda = lambda_i,
+        EQMP = Inf,
+        estavel = FALSE,
+        motivo = "previsao_instavel"
+      )
+
+      next
+    }
+
+    # ----------------------------------------------------------
+    # EQMP na janela de validação
+    # ----------------------------------------------------------
+
+    eqmp <- mean(
+      (preds - serie_validacao)^2
+    )
+
+    resultados[[i]] <- data.frame(
+      lambda = lambda_i,
+      EQMP = eqmp,
+      estavel = is.finite(eqmp),
+      motivo = ifelse(
+        is.finite(eqmp),
+        "ok",
+        "eqmp_invalido"
+      )
+    )
+  }
+
+  tabela_lambda <- bind_rows(resultados) %>%
+    arrange(EQMP)
+
+  validos <- tabela_lambda %>%
+    filter(
+      estavel,
+      is.finite(EQMP)
+    )
+
+  if (nrow(validos) == 0) {
+
+    return(
+      list(
+        tabela = tabela_lambda,
+        melhor = NULL,
+        modelo = modelo_path,
+        X = X_treino
+      )
+    )
+  }
+
+  list(
+    tabela = tabela_lambda,
+    melhor = validos[1, ],
+    modelo = modelo_path,
+    X = X_treino
+  )
+}
+```
+
+### Seleção conjunta de $(\tau,m)$ e $\lambda$
+
+```{r}
+resultados_cv_lasso <- vector(
+  "list",
+  length(grid_tau) * length(grid_m)
+)
+
+detalhes_lambda_lasso <- vector(
+  "list",
+  length(grid_tau) * length(grid_m)
+)
+
+k <- 1
+
+for (tau_i in grid_tau) {
+  for (m_i in grid_m) {
+
+    resultado <- list(
+      tau = tau_i,
+      m = m_i,
+      EQMP = Inf,
+      estavel = FALSE,
+      lambda = NA_real_,
+      motivo = NA_character_
+    )
+
+    # ----------------------------------------------------------
+    # Verificação de histórico suficiente
+    # ----------------------------------------------------------
+
+    if ((m_i - 1) * tau_i >= length(serie_treino_cv)) {
+
+      resultado$motivo <- "historico_insuficiente"
+
+      resultados_cv_lasso[[k]] <- resultado
+
+      k <- k + 1
+
+      next
+    }
+
+    # ----------------------------------------------------------
+    # Construção do embedding
+    # ----------------------------------------------------------
+
+    dados_i <- tryCatch(
+      build_embedding_matrix(
+        serie_treino_cv,
+        tau_i,
+        m_i
+      ),
+      error = function(e) NULL
+    )
+
+    if (is.null(dados_i)) {
+
+      resultado$motivo <- "falha_embedding"
+
+      resultados_cv_lasso[[k]] <- resultado
+
+      k <- k + 1
+
+      next
+    }
+
+    # ----------------------------------------------------------
+    # Seleção manual de lambda
+    #
+    # IMPORTANTE:
+    # dados_i$X contém TODOS os lags.
+    # O LASSO será ajustado sobre todos eles.
+    # ----------------------------------------------------------
+
+    selecao_lambda <- tryCatch(
+      avaliar_lambdas_manual(
+        X_treino = dados_i$X,
+        Y_treino = dados_i$Y,
+        serie_treino = serie_treino_cv,
+        serie_validacao = serie_validacao,
+        tau = tau_i,
+        fator_sanidade = fator_sanidade,
+        nlambda = 100
+      ),
+      error = function(e) NULL
+    )
+
+    detalhes_lambda_lasso[[k]] <- selecao_lambda
+
+    # ----------------------------------------------------------
+    # Verificação do resultado da seleção de lambda
+    # ----------------------------------------------------------
+
+    if (
+      is.null(selecao_lambda) ||
+      is.null(selecao_lambda$melhor)
+    ) {
+
+      resultado$motivo <- "nenhum_lambda_valido"
+
+      resultados_cv_lasso[[k]] <- resultado
+
+      k <- k + 1
+
+      next
+    }
+
+    # ----------------------------------------------------------
+    # Armazena o melhor resultado da combinação tau,m
+    # ----------------------------------------------------------
+
+    resultado$EQMP <- selecao_lambda$melhor$EQMP
+
+    resultado$lambda <- selecao_lambda$melhor$lambda
+
+    resultado$estavel <- TRUE
+
+    resultado$motivo <- "ok"
+
+    resultados_cv_lasso[[k]] <- resultado
+
+    k <- k + 1
+  }
+}
+
+# --------------------------------------------------------------
+# Tabela final da seleção
+# --------------------------------------------------------------
+
+tabela_cv_lasso <- bind_rows(
+  resultados_cv_lasso
+)
+
+tabela_validos_lasso <- tabela_cv_lasso %>%
+  filter(
+    estavel,
+    is.finite(EQMP)
+  ) %>%
+  arrange(EQMP)
+
+if (nrow(tabela_validos_lasso) == 0) {
+
+  stop(
+    "Nenhuma combinação tau/m foi considerada estável para LASSO."
+  )
+}
+
+melhor_lasso <- tabela_validos_lasso[1, ]
+
+tau_lasso <- melhor_lasso$tau
+
+m_lasso <- melhor_lasso$m
+
+lambda_otimo <- melhor_lasso$lambda
+
+baseline_lasso <- tabela_cv_lasso %>%
+  filter(
+    tau == 1,
+    m == 36
+  ) %>%
+  pull(EQMP)
+
+cat("\n=== SELEÇÃO DE TAU, M E LAMBDA — LASSO ===\n")
+
+cat(
+  "Melhor tau:",
+  tau_lasso,
+  "\n"
+)
+
+cat(
+  "Melhor m:",
+  m_lasso,
+  "\n"
+)
+
+cat(
+  "Melhor lambda:",
+  format(
+    lambda_otimo,
+    scientific = TRUE
+  ),
+  "\n"
+)
+
+cat(
+  "EQMP de validação:",
+  round(
+    melhor_lasso$EQMP,
+    3
+  ),
+  "\n"
+)
+
+cat(
+  "Combinações estáveis:",
+  nrow(tabela_validos_lasso),
+  "de",
+  nrow(tabela_cv_lasso),
+  "\n"
+)
+
+knitr::kable(
+  tabela_cv_lasso %>%
+    mutate(
+      EQMP = ifelse(
+        is.finite(EQMP),
+        round(EQMP, 3),
+        NA_real_
+      ),
+      lambda = ifelse(
+        is.finite(lambda),
+        signif(lambda, 6),
+        NA_real_
+      )
+    ),
+  caption = "Seleção temporal de $\\tau$, $m$ e $\\lambda$ para o LASSO",
+  booktabs = TRUE
+)
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+
+grafico_cv_lasso <- ggplot(
+  tabela_cv_lasso,
+  aes(x = m, y = tau, fill = EQMP)
+) +
+  geom_tile(color = "white") +
+  geom_point(
+    data = tabela_cv_lasso %>%
+      filter(tau == tau_lasso, m == m_lasso),
+    aes(x = m, y = tau),
+    shape = 21,
+    size = 5,
+    fill = NA,
+    stroke = 1.2
+  ) +
+  labs(
+    x = "Dimensão do embedding (m)",
+    y = "Atraso temporal (tau)",
+    fill = "EQMP de validação"
+  ) +
+  theme_minimal()
+
+grafico_cv_lasso
+
+ggsave(
+  file.path(dir_figuras, "cv_tau_m_lasso.png"),
+  grafico_cv_lasso,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+```
+
+### Ajuste final do LASSO no conjunto de treino completo
+
+Após a seleção, utiliza-se a combinação $(\tau,m)$ selecionada na validação. O parâmetro $\lambda$ é mantido fixo no valor selecionado na validação. O modelo é então reestimado com **todo o conjunto de treino** (241 observações), mantendo o conjunto de teste intocado.
+
+```{r}
+dados_emb_lasso <- build_embedding_matrix(
+  as.numeric(Residencial_treino),
+  tau_lasso,
+  m_lasso
+)
+
+# --------------------------------------------------------------
+# TODOS os lags do embedding são utilizados no LASSO.
+# O próprio LASSO realiza a seleção dos preditores.
+# --------------------------------------------------------------
+
+X_mat_lasso <- as.matrix(
+  dados_emb_lasso$X
+)
+
+Y_vec_lasso <- dados_emb_lasso$Y
+
+# --------------------------------------------------------------
+# Ajuste final do LASSO
+# --------------------------------------------------------------
+
+modelo_lasso <- glmnet(
+  x = X_mat_lasso,
+  y = Y_vec_lasso,
+  alpha = 1,
+  lambda = lambda_otimo
+)
+
+# --------------------------------------------------------------
+# Coeficientes do modelo
+# --------------------------------------------------------------
+
+coef_lasso <- coef(
+  modelo_lasso,
+  s = lambda_otimo
+)
+
+nomes_coef <- rownames(coef_lasso)
+
+vals_coef <- as.numeric(
+  coef_lasso
+)
+
+# --------------------------------------------------------------
+# Identifica os lags mantidos pelo LASSO
+# --------------------------------------------------------------
+
+nao_nulos <- nomes_coef[
+  vals_coef != 0 &
+  nomes_coef != "(Intercept)"
+]
+
+nomes_preditores_lasso <- nao_nulos
+
+lags_lasso <- as.integer(
+  gsub(
+    "^lag_",
+    "",
+    nomes_preditores_lasso
+  )
+)
+
+cat("=== Hiperparâmetros selecionados para LASSO ===\n")
+
+cat(
+  "tau =",
+  tau_lasso,
+  "\n"
+)
+
+cat(
+  "m   =",
+  m_lasso,
+  "\n"
+)
+
+cat(
+  "lambda =",
+  format(
+    lambda_otimo,
+    scientific = TRUE
+  ),
+  "\n"
+)
+
+cat(
+  "Total de lags disponíveis no embedding:",
+  ncol(X_mat_lasso),
+  "\n"
+)
+
+cat(
+  "Lags efetivamente mantidos pelo LASSO:",
+  lags_lasso,
+  "\n"
+)
+
+cat(
+  "Total de lags não nulos após LASSO:",
+  length(lags_lasso),
+  "de",
+  ncol(X_mat_lasso),
+  "\n"
+)
+
+df_coef_lasso <- data.frame(
+  Lag = nomes_preditores_lasso,
+  Coeficiente = round(
+    vals_coef[
+      vals_coef != 0 &
+      nomes_coef != "(Intercept)"
+    ],
+    6
+  )
+)
+
+knitr::kable(
+  df_coef_lasso,
+  caption = "Coeficientes não nulos selecionados pelo LASSO",
+  booktabs = TRUE
+)
+```
+
+```{r}
+pred_emb_lasso <- previsao_recursiva(
+  modelo = modelo_lasso,
+  x = X_mat_lasso,
+  y = Y_vec_lasso,
+  H = H,
+  alvo = teste,
+  tipo = "lasso",
+  lambda_val = lambda_otimo
+)
+```
+
+## Variante 4 — RIDGE
+
+```{r}
+avaliar_lambdas_manual_ridge <- function(
+    X_treino, Y_treino, serie_treino, serie_validacao,
+    tau, fator_sanidade = 3,
+    nlambda = 100) {
+
+  modelo_path <- glmnet::glmnet(
+    x = X_treino,
+    y = Y_treino,
+    alpha = 0,
+    nlambda = nlambda
+  )
+
+  lambdas <- modelo_path$lambda
+  resultados <- vector("list", length(lambdas))
+
+  for (i in seq_along(lambdas)) {
+
+    lambda_i <- lambdas[i]
+
+    preds <- tryCatch(
+      previsao_recursiva(
+        modelo = modelo_path,
+        x = X_treino,
+        y = Y_treino,
+        H = length(serie_validacao),
+        alvo = serie_validacao,
+        tipo = "lasso",
+        lambda_val = lambda_i
+      ),
+      error = function(e) NULL
+    )
+
+    if (is.null(preds)) {
+      resultados[[i]] <- data.frame(
+        lambda = lambda_i,
+        EQMP = Inf,
+        estavel = FALSE,
+        motivo = "falha_previsao"
+      )
+      next
+    }
+
+    limite <- fator_sanidade *
+      max(abs(serie_treino), na.rm = TRUE)
+
+    instavel <- any(
+      !is.finite(preds) |
+      abs(preds) > limite |
+      preds <= 0
+    )
+
+    if (instavel) {
+      resultados[[i]] <- data.frame(
+        lambda = lambda_i,
+        EQMP = Inf,
+        estavel = FALSE,
+        motivo = "previsao_instavel"
+      )
+      next
+    }
+
+    eqmp <- mean(
+      (preds - serie_validacao)^2
+    )
+
+    resultados[[i]] <- data.frame(
+      lambda = lambda_i,
+      EQMP = eqmp,
+      estavel = is.finite(eqmp),
+      motivo = ifelse(
+        is.finite(eqmp),
+        "ok",
+        "eqmp_invalido"
+      )
+    )
+  }
+
+  tabela_lambda <- bind_rows(resultados) %>%
+    arrange(EQMP)
+
+  validos <- tabela_lambda %>%
+    filter(
+      estavel,
+      is.finite(EQMP)
+    )
+
+  if (nrow(validos) == 0) {
+    return(list(
+      tabela = tabela_lambda,
+      melhor = NULL,
+      modelo = modelo_path,
+      X = X_treino
+    ))
+  }
+
+  list(
+    tabela = tabela_lambda,
+    melhor = validos[1, ],
+    modelo = modelo_path,
+    X = X_treino
+  )
+}
+```
+
+```{r}
+# ============================================================
+# VARIANTE 4 — RIDGE
+# Seleção temporal de tau, m e lambda
+# ============================================================
+
+resultados_cv_ridge <- vector(
+  "list",
+  length(grid_tau) * length(grid_m)
+)
+
+detalhes_lambda_ridge <- vector(
+  "list",
+  length(grid_tau) * length(grid_m)
+)
+
+k <- 1
+
+for (tau_i in grid_tau) {
+  for (m_i in grid_m) {
+
+    resultado <- list(
+      tau = tau_i,
+      m = m_i,
+      EQMP = Inf,
+      estavel = FALSE,
+      lambda = NA_real_,
+      motivo = NA_character_
+    )
+
+    if ((m_i - 1) * tau_i >= length(serie_treino_cv)) {
+      resultado$motivo <- "historico_insuficiente"
+
+      resultados_cv_ridge[[k]] <- resultado
+
+      k <- k + 1
+      next
+    }
+
+    dados_i <- tryCatch(
+      build_embedding_matrix(
+        serie_treino_cv,
+        tau_i,
+        m_i
+      ),
+      error = function(e) NULL
+    )
+
+    if (is.null(dados_i)) {
+      resultado$motivo <- "falha_embedding"
+
+      resultados_cv_ridge[[k]] <- resultado
+
+      k <- k + 1
+      next
+    }
+
+    selecao_lambda <- tryCatch(
+      avaliar_lambdas_manual_ridge(
+        X_treino = dados_i$X,
+        Y_treino = dados_i$Y,
+        serie_treino = serie_treino_cv,
+        serie_validacao = serie_validacao,
+        tau = tau_i,
+        fator_sanidade = fator_sanidade,
+        nlambda = 100
+      ),
+      error = function(e) NULL
+    )
+
+    detalhes_lambda_ridge[[k]] <- selecao_lambda
+
+    if (
+      is.null(selecao_lambda) ||
+      is.null(selecao_lambda$melhor)
+    ) {
+
+      resultado$motivo <- "nenhum_lambda_valido"
+
+      resultados_cv_ridge[[k]] <- resultado
+
+      k <- k + 1
+      next
+    }
+
+    resultado$EQMP <-
+      selecao_lambda$melhor$EQMP
+
+    resultado$lambda <-
+      selecao_lambda$melhor$lambda
+
+    resultado$estavel <- TRUE
+    resultado$motivo <- "ok"
+
+    resultados_cv_ridge[[k]] <- resultado
+
+    k <- k + 1
+  }
+}
+
+tabela_cv_ridge <- bind_rows(
+  resultados_cv_ridge
+)
+
+tabela_validos_ridge <- tabela_cv_ridge %>%
+  filter(
+    estavel,
+    is.finite(EQMP)
+  ) %>%
+  arrange(EQMP)
+
+if (nrow(tabela_validos_ridge) == 0) {
+  stop(
+    "Nenhuma combinação tau/m foi considerada estável para Ridge."
+  )
+}
+
+melhor_ridge <- tabela_validos_ridge[1, ]
+
+tau_ridge <- melhor_ridge$tau
+m_ridge <- melhor_ridge$m
+lambda_otimo_ridge <- melhor_ridge$lambda
+
+baseline_ridge <- tabela_cv_ridge %>%
+  filter(
+    tau == 1,
+    m == 36
+  ) %>%
+  pull(EQMP)
+
+cat("\n=== SELEÇÃO DE TAU, M E LAMBDA — RIDGE ===\n")
+cat("Melhor tau:", tau_ridge, "\n")
+cat("Melhor m:", m_ridge, "\n")
+cat(
+  "Melhor lambda:",
+  format(
+    lambda_otimo_ridge,
+    scientific = TRUE
+  ),
+  "\n"
+)
+cat(
+  "EQMP de validação:",
+  round(melhor_ridge$EQMP, 3),
+  "\n"
+)
+cat(
+  "Combinações estáveis:",
+  nrow(tabela_validos_ridge),
+  "de",
+  nrow(tabela_cv_ridge),
+  "\n"
+)
+
+knitr::kable(
+  tabela_cv_ridge %>%
+    mutate(
+      EQMP = ifelse(
+        is.finite(EQMP),
+        round(EQMP, 3),
+        NA_real_
+      ),
+      lambda = ifelse(
+        is.finite(lambda),
+        signif(lambda, 6),
+        NA_real_
+      )
+    ),
+  caption =
+    "Seleção temporal de $\\tau$, $m$ e $\\lambda$ para o Ridge",
+  booktabs = TRUE
+)
+```
+
+```{r}
+# ============================================================
+# AJUSTE FINAL — RIDGE
+# ============================================================
+
+dados_emb_ridge <- build_embedding_matrix(
+  as.numeric(Residencial_treino),
+  tau_ridge,
+  m_ridge
+)
+
+X_mat_ridge <- as.matrix(
+  dados_emb_ridge$X
+)
+
+Y_vec_ridge <- dados_emb_ridge$Y
+
+modelo_ridge <- glmnet(
+  x = X_mat_ridge,
+  y = Y_vec_ridge,
+  alpha = 0,
+  lambda = lambda_otimo_ridge
+)
+
+coef_ridge <- coef(
+  modelo_ridge,
+  s = lambda_otimo_ridge
+)
+
+nomes_coef_ridge <- rownames(coef_ridge)
+vals_coef_ridge <- as.numeric(coef_ridge)
+
+nomes_preditores_ridge <-
+  nomes_coef_ridge[
+    nomes_coef_ridge != "(Intercept)"
+  ]
+
+lags_ridge <- as.integer(
+  gsub(
+    "^lag_",
+    "",
+    nomes_preditores_ridge
+  )
+)
+
+cat("\n=== HIPERPARÂMETROS SELECIONADOS PARA RIDGE ===\n")
+cat("tau =", tau_ridge, "\n")
+cat("m =", m_ridge, "\n")
+cat(
+  "lambda =",
+  format(
+    lambda_otimo_ridge,
+    scientific = TRUE
+  ),
+  "\n"
+)
+
+cat(
+  "Total de lags disponíveis no embedding:",
+  ncol(X_mat_ridge),
+  "\n"
+)
+
+cat(
+  "Total de coeficientes dos lags:",
+  length(lags_ridge),
+  "\n"
+)
+
+df_coef_ridge <- data.frame(
+  Lag = nomes_preditores_ridge,
+  Coeficiente = round(
+    vals_coef_ridge[
+      nomes_coef_ridge != "(Intercept)"
+    ],
+    6
+  )
+)
+
+knitr::kable(
+  df_coef_ridge,
+  caption =
+    "Coeficientes do modelo Ridge",
+  booktabs = TRUE
+)
+```
+
+```{r}
+res_ridge <- Y_vec_ridge -
+  predict(
+    modelo_ridge,
+    newx = X_mat_ridge,
+    s = lambda_otimo_ridge
+  )
+```
+
+```{r}
+# ============================================================
+# PREVISÃO RECURSIVA — RIDGE
+# ============================================================
+
+pred_emb_ridge <- previsao_recursiva(
+  modelo = modelo_ridge,
+  x = X_mat_ridge,
+  y = Y_vec_ridge,
+  H = H,
+  alvo = teste,
+  tipo = "lasso",
+  lambda_val = lambda_otimo_ridge
+)
+```
+
+## Variante 5 — ELASTIC NET
+
+```{r}
+avaliar_lambdas_manual_elastic <- function(
+    X_treino, Y_treino, serie_treino, serie_validacao,
+    tau, fator_sanidade = 3,
+    nlambda = 100) {
+  
+  modelo_path <- glmnet::glmnet(
+    x = X_treino,
+    y = Y_treino,
+    alpha = 0.5,
+    nlambda = nlambda
+  )
+  
+  lambdas <- modelo_path$lambda
+  resultados <- vector("list", length(lambdas))
+  
+  for (i in seq_along(lambdas)) {
+    
+    lambda_i <- lambdas[i]
+    
+    preds <- tryCatch(
+      previsao_recursiva(
+        modelo = modelo_path,
+        x = X_treino,
+        y = Y_treino,
+        H = length(serie_validacao),
+        alvo = serie_validacao,
+        tipo = "lasso",
+        lambda_val = lambda_i
+      ),
+      error = function(e) NULL
+    )
+    
+    if (is.null(preds)) {
+      resultados[[i]] <- data.frame(
+        lambda = lambda_i,
+        EQMP = Inf,
+        estavel = FALSE,
+        motivo = "falha_previsao"
+      )
+      next
+    }
+    
+    limite <- fator_sanidade *
+      max(abs(serie_treino), na.rm = TRUE)
+    
+    instavel <- any(
+      !is.finite(preds) |
+        abs(preds) > limite |
+        preds <= 0
+    )
+    
+    if (instavel) {
+      resultados[[i]] <- data.frame(
+        lambda = lambda_i,
+        EQMP = Inf,
+        estavel = FALSE,
+        motivo = "previsao_instavel"
+      )
+      next
+    }
+    
+    eqmp <- mean(
+      (preds - serie_validacao)^2
+    )
+    
+    resultados[[i]] <- data.frame(
+      lambda = lambda_i,
+      EQMP = eqmp,
+      estavel = is.finite(eqmp),
+      motivo = ifelse(
+        is.finite(eqmp),
+        "ok",
+        "eqmp_invalido"
+      )
+    )
+  }
+  
+  tabela_lambda <- bind_rows(resultados) %>%
+    arrange(EQMP)
+  
+  validos <- tabela_lambda %>%
+    filter(
+      estavel,
+      is.finite(EQMP)
+    )
+  
+  if (nrow(validos) == 0) {
+    return(list(
+      tabela = tabela_lambda,
+      melhor = NULL,
+      modelo = modelo_path,
+      X = X_treino
+    ))
+  }
+  
+  list(
+    tabela = tabela_lambda,
+    melhor = validos[1, ],
+    modelo = modelo_path,
+    X = X_treino
+  )
+}
+
+```
+
+```{r}
+# ============================================================
+# VARIANTE 5 — ELASTIC NET
+# Seleção temporal de tau, m e lambda
+# ============================================================
+
+resultados_cv_elastic <- vector(
+  "list",
+  length(grid_tau) * length(grid_m)
+)
+
+detalhes_lambda_elastic <- vector(
+  "list",
+  length(grid_tau) * length(grid_m)
+)
+
+k <- 1
+
+for (tau_i in grid_tau) {
+  for (m_i in grid_m) {
+    
+    resultado <- list(
+      tau = tau_i,
+      m = m_i,
+      EQMP = Inf,
+      estavel = FALSE,
+      lambda = NA_real_,
+      motivo = NA_character_
+    )
+    
+    if ((m_i - 1) * tau_i >= length(serie_treino_cv)) {
+      resultado$motivo <- "historico_insuficiente"
+      
+      resultados_cv_elastic[[k]] <- resultado
+      
+      k <- k + 1
+      next
+    }
+    
+    dados_i <- tryCatch(
+      build_embedding_matrix(
+        serie_treino_cv,
+        tau_i,
+        m_i
+      ),
+      error = function(e) NULL
+    )
+    
+    if (is.null(dados_i)) {
+      resultado$motivo <- "falha_embedding"
+      
+      resultados_cv_elastic[[k]] <- resultado
+      
+      k <- k + 1
+      next
+    }
+    
+    selecao_lambda <- tryCatch(
+      avaliar_lambdas_manual_elastic(
+        X_treino = dados_i$X,
+        Y_treino = dados_i$Y,
+        serie_treino = serie_treino_cv,
+        serie_validacao = serie_validacao,
+        tau = tau_i,
+        fator_sanidade = fator_sanidade,
+        nlambda = 100
+      ),
+      error = function(e) NULL
+    )
+    
+    detalhes_lambda_elastic[[k]] <- selecao_lambda
+    
+    if (
+      is.null(selecao_lambda) ||
+      is.null(selecao_lambda$melhor)
+    ) {
+      
+      resultado$motivo <- "nenhum_lambda_valido"
+      
+      resultados_cv_elastic[[k]] <- resultado
+      
+      k <- k + 1
+      next
+    }
+    
+    resultado$EQMP <-
+      selecao_lambda$melhor$EQMP
+    
+    resultado$lambda <-
+      selecao_lambda$melhor$lambda
+    
+    resultado$estavel <- TRUE
+    resultado$motivo <- "ok"
+    
+    resultados_cv_elastic[[k]] <- resultado
+    
+    k <- k + 1
+  }
+}
+
+tabela_cv_elastic <- bind_rows(
+  resultados_cv_elastic
+)
+
+tabela_validos_elastic <- tabela_cv_elastic %>%
+  filter(
+    estavel,
+    is.finite(EQMP)
+  ) %>%
+  arrange(EQMP)
+
+if (nrow(tabela_validos_elastic) == 0) {
+  stop(
+    "Nenhuma combinação tau/m foi considerada estável para Elastic Net."
+  )
+}
+
+melhor_elastic <- tabela_validos_elastic[1, ]
+
+tau_elastic <- melhor_elastic$tau
+m_elastic <- melhor_elastic$m
+lambda_otimo_elastic <- melhor_elastic$lambda
+
+baseline_elastic <- tabela_cv_elastic %>%
+  filter(
+    tau == 1,
+    m == 36
+  ) %>%
+  pull(EQMP)
+
+cat("\n=== SELEÇÃO DE TAU, M E LAMBDA — ELASTIC NET ===\n")
+cat("Alpha:", 0.5, "\n")
+cat("Melhor tau:", tau_elastic, "\n")
+cat("Melhor m:", m_elastic, "\n")
+cat(
+  "Melhor lambda:",
+  format(
+    lambda_otimo_elastic,
+    scientific = TRUE
+  ),
+  "\n"
+)
+cat(
+  "EQMP de validação:",
+  round(melhor_elastic$EQMP, 3),
+  "\n"
+)
+cat(
+  "Combinações estáveis:",
+  nrow(tabela_validos_elastic),
+  "de",
+  nrow(tabela_cv_elastic),
+  "\n"
+)
+
+knitr::kable(
+  tabela_cv_elastic %>%
+    mutate(
+      EQMP = ifelse(
+        is.finite(EQMP),
+        round(EQMP, 3),
+        NA_real_
+      ),
+      lambda = ifelse(
+        is.finite(lambda),
+        signif(lambda, 6),
+        NA_real_
+      )
+    ),
+  caption =
+    "Seleção temporal de $\\tau$, $m$ e $\\lambda$ para o Elastic Net",
+  booktabs = TRUE
+)
+```
+
+```{r}
+# ============================================================
+# AJUSTE FINAL — ELASTIC NET
+# ============================================================
+
+dados_emb_elastic <- build_embedding_matrix(
+  as.numeric(Residencial_treino),
+  tau_elastic,
+  m_elastic
+)
+
+X_mat_elastic <- as.matrix(
+  dados_emb_elastic$X
+)
+
+Y_vec_elastic <- dados_emb_elastic$Y
+
+modelo_elastic <- glmnet(
+  x = X_mat_elastic,
+  y = Y_vec_elastic,
+  alpha = 0.5,
+  lambda = lambda_otimo_elastic
+)
+
+coef_elastic <- coef(
+  modelo_elastic,
+  s = lambda_otimo_elastic
+)
+
+nomes_coef_elastic <- rownames(coef_elastic)
+vals_coef_elastic <- as.numeric(coef_elastic)
+
+nomes_preditores_elastic <-
+  nomes_coef_elastic[
+    nomes_coef_elastic != "(Intercept)"
+  ]
+
+lags_elastic <- as.integer(
+  gsub(
+    "^lag_",
+    "",
+    nomes_preditores_elastic
+  )
+)
+
+cat("\n=== HIPERPARÂMETROS SELECIONADOS PARA ELASTIC NET ===\n")
+cat("Alpha =", 0.5, "\n")
+cat("tau =", tau_elastic, "\n")
+cat("m =", m_elastic, "\n")
+cat(
+  "lambda =",
+  format(
+    lambda_otimo_elastic,
+    scientific = TRUE
+  ),
+  "\n"
+)
+
+cat(
+  "Total de lags disponíveis no embedding:",
+  ncol(X_mat_elastic),
+  "\n"
+)
+
+cat(
+  "Total de coeficientes dos lags:",
+  length(lags_elastic),
+  "\n"
+)
+
+df_coef_elastic <- data.frame(
+  Lag = nomes_preditores_elastic,
+  Coeficiente = round(
+    vals_coef_elastic[
+      nomes_coef_elastic != "(Intercept)"
+    ],
+    6
+  )
+)
+
+knitr::kable(
+  df_coef_elastic,
+  caption =
+    "Coeficientes do modelo Elastic Net",
+  booktabs = TRUE
+)
+```
+
+```{r}
+
+res_elastic <- Y_vec_elastic -
+  predict(
+    modelo_elastic,
+    newx = X_mat_elastic,
+    s = lambda_otimo_elastic
+  )
+
+```
+
+```{r}
+# ============================================================
+# PREVISÃO RECURSIVA — ELASTIC NET
+# ============================================================
+
+pred_emb_elastic <- previsao_recursiva(
+  modelo = modelo_elastic,
+  x = X_mat_elastic,
+  y = Y_vec_elastic,
+  H = H,
+  alvo = teste,
+  tipo = "lasso",
+  lambda_val = lambda_otimo_elastic
+)
+```
+
+------------------------------------------------------------------------
+
+# Comparação dos Modelos
+
+## Tabela de Previsões
+
+```{r}
+datas_futuro <- time(
+  ts(teste, start = end(Residencial_treino) + c(0, 1), frequency = 12)
+)
+datas_labels <- as.yearmon(datas_futuro)
+
+tabela_previsoes <- data.frame(
+  Data = format(datas_labels, "%b/%Y"),
+  teste = round(teste, 2),
+  SARIMA = round(pred_sarima, 2),
+  Emb_Completo = round(pred_emb_completo, 2),
+  Emb_Significativo = round(pred_emb_sig, 2),
+  Emb_LASSO = round(pred_emb_lasso, 2),
+  Emb_Ridge = round(pred_emb_ridge, 2),
+  Emb_ElasticNet = round(pred_emb_elastic, 2)
+)
+
+knitr::kable(
+  tabela_previsoes,
+  caption  = "Previsões: SARIMA vs. variantes de Regressão por Delay Embedding",
+  align    = c("l", rep("c", 7)),
+  booktabs = TRUE
+)
+
+write.csv(tabela_previsoes,
+          file.path(dir_figuras, "tabela_previsoes.csv"),
+          row.names = FALSE)
+```
+
+## Erro Quadrático Médio de Previsão (EQMP)
+
+$$\text{EQMP} = \frac{1}{H} \sum_{h=1}^{H} \left(\hat{Y}_{n+h} - Y_{n+h}\right)^2$$
+
+```{r}
+tabela_eqmp <- data.frame(
+  Modelo = c(
+    "SARIMA",
+    "Embedding — Completo",
+    "Embedding — Lags Significativos",
+    "Embedding — LASSO",
+    "Embedding — RIDGE",
+    "Embedding — Elastic Net"
+  ),
+  tau = c(NA, tau_emb, tau_emb, tau_lasso, tau_ridge, tau_elastic),
+  m   = c(NA, m_emb,   m_emb,   m_lasso,   m_ridge,   m_elastic),
+  EQMP = round(c(
+    mean((teste - pred_sarima)^2),
+    mean((teste - pred_emb_completo)^2),
+    mean((teste - pred_emb_sig)^2),
+    mean((teste - pred_emb_lasso)^2),
+    mean((teste - pred_emb_ridge)^2),
+    mean((teste - pred_emb_elastic)^2)
+  ), 2)
+)
+
+tabela_eqmp <- tabela_eqmp[order(tabela_eqmp$EQMP), ]
+rownames(tabela_eqmp) <- NULL
+
+# EQMP percentual: EQMP relativo à variância da série no período de teste (0% = perfeito;
+# 100% = tão ruim quanto prever a média do teste)
+var_teste <- mean((teste - mean(teste))^2)
+tabela_eqmp$EQMP_pct <- round(100 * tabela_eqmp$EQMP / var_teste, 1)
+
+knitr::kable(
+  tabela_eqmp,
+  caption  = "Comparação de EQMP — horizonte H = 12 (ordenado por desempenho)",
+  align    = c("l", "c", "c", "c", "c"),
+  booktabs = TRUE
+)
+
+write.csv(tabela_eqmp,
+          file.path(dir_figuras, "tabela_eqmp.csv"),
+          row.names = FALSE)
+```
+
+## Erro Quadrático por Horizonte de Previsão
+
+```{r}
+#| fig-width: 12
+#| fig-height: 5
+
+tabela_erro_h <- data.frame(
+  h           = 1:H,
+  Data        = format(datas_labels, "%b/%Y"),
+  SARIMA      = (teste - pred_sarima)^2,
+  Completo    = (teste - pred_emb_completo)^2,
+  Sig         = (teste - pred_emb_sig)^2,
+  LASSO       = (teste - pred_emb_lasso)^2,
+  RIDGE       = (teste - pred_emb_ridge)^2,
+  ElasticNET  = (teste - pred_emb_elastic)^2
+)
+
+tabela_erro_long <- tabela_erro_h %>%
+  pivot_longer(cols = c(SARIMA, Completo, Sig, LASSO, RIDGE, ElasticNET),
+               names_to = "Modelo", values_to = "Erro_Quadratico")
+
+grafico_erro_h <- ggplot(tabela_erro_long, aes(x = h, y = Erro_Quadratico, color = Modelo)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(x = "Horizonte de previsão (h)", y = "Erro quadrático",
+       color = "Modelo") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+grafico_erro_h
+
+ggsave(file.path(dir_figuras, "11_erro_quadratico_por_horizonte.png"),
+       grafico_erro_h, width = 12, height = 5, dpi = 300)
+```
+
+## Ajuste e previsão das variantes de embedding
+
+Azul: valores ajustados no treino (1 passo, com as defasagens observadas); preto: série observada; vermelho: previsão de 1 passo no teste. É o mesmo formato do gráfico do SARIMA.
+
+```{r}
+#| fig-width: 12
+#| fig-height: 9
+
+n_tr_e  <- length(Residencial_treino)
+n_all_e <- length(Residencial)
+tempo_e <- as.numeric(time(Residencial))
+
+aj_var <- function(modelo, X, tau, m, tipo, lam = NULL) {
+  L <- (m - 1) * tau
+  f <- if (tipo == "lm") as.numeric(fitted(modelo)) else
+    as.numeric(predict(modelo, newx = as.matrix(X), s = lam))
+  data.frame(t = tempo_e[(L + 1):n_tr_e], y = f)
+}
+
+ajustes_var <- list(
+  "Embedding — Completo (MQO)"      = aj_var(modelo_emb_completo, X_treino, tau_emb, m_emb, "lm"),
+  "Embedding — Lags Significativos" = aj_var(modelo_emb_sig, X_sig, tau_emb, m_emb, "lm"),
+  "Embedding — LASSO"               = aj_var(modelo_lasso, X_mat_lasso, tau_lasso, m_lasso, "glm", lambda_otimo),
+  "Embedding — Ridge"               = aj_var(modelo_ridge, X_mat_ridge, tau_ridge, m_ridge, "glm", lambda_otimo_ridge),
+  "Embedding — Elastic Net"         = aj_var(modelo_elastic, X_mat_elastic, tau_elastic, m_elastic, "glm", lambda_otimo_elastic)
+)
+previsoes_var <- list(
+  "Embedding — Completo (MQO)"      = pred_emb_completo,
+  "Embedding — Lags Significativos" = pred_emb_sig,
+  "Embedding — LASSO"               = pred_emb_lasso,
+  "Embedding — Ridge"               = pred_emb_ridge,
+  "Embedding — Elastic Net"         = pred_emb_elastic
+)
+nomes_var <- names(ajustes_var)
+t_teste   <- tempo_e[(n_tr_e + 1):n_all_e]
+
+df_aj_var <- bind_rows(lapply(nomes_var, function(nm) cbind(Modelo = nm, ajustes_var[[nm]])))
+df_pr_var <- bind_rows(lapply(nomes_var, function(nm)
+  data.frame(Modelo = nm, t = t_teste, y = previsoes_var[[nm]])))
+df_ob_var <- data.frame(t = tempo_e, y = as.numeric(Residencial))
+df_aj_var$Modelo <- factor(df_aj_var$Modelo, nomes_var)
+df_pr_var$Modelo <- factor(df_pr_var$Modelo, nomes_var)
+
+grafico_ajuste_var <- ggplot() +
+  geom_line(data = df_ob_var, aes(t, y), color = "black", linewidth = 0.5) +
+  geom_line(data = df_aj_var, aes(t, y), color = "#4C72B0", linewidth = 0.8) +
+  geom_line(data = df_pr_var, aes(t, y), color = "firebrick", linewidth = 0.9) +
+  geom_vline(xintercept = tempo_e[n_tr_e] + 1/24, linetype = "dotted") +
+  facet_wrap(~ Modelo, ncol = 2) +
+  coord_cartesian(xlim = c(2019.8, 2026.1)) +
+  labs(x = "Ano", y = "Consumo Residencial (GWh)") +
+  theme_minimal()
+grafico_ajuste_var
+
+ggsave(file.path(dir_figuras, "16_ajuste_e_previsao_variantes.png"),
+       grafico_ajuste_var, width = 12, height = 9, dpi = 200)
+```
+
+## Intervalos de predição (95%)
+
+Como a predição é de 1 passo, o intervalo do SARIMA usa o desvio-padrão dos resíduos do ajuste (± 1,96). Para as variantes de embedding, usa-se o **bootstrap dos resíduos**: a cada instante soma-se à predição um resíduo sorteado do ajuste (1000 repetições), e o intervalo é formado pelos percentis 2,5% e 97,5%. Esse intervalo não inclui a incerteza na estimação dos coeficientes.
+
+```{r}
+res_lasso_ic <- as.numeric(
+  Y_vec_lasso - predict(modelo_lasso, newx = X_mat_lasso, s = lambda_otimo)
+)
+
+ic_bootstrap <- function(modelo, x, y, H, tipo, lambda_val = NULL,
+                         residuos, B = 1000, nivel = 0.95, semente = 123) {
+  set.seed(semente)
+  sims <- replicate(B, previsao_recursiva(
+    modelo = modelo, x = x, y = y, H = H, tipo = tipo, alvo = teste,
+    lambda_val = lambda_val, residuos = as.numeric(residuos)
+  ))
+  sims[!is.finite(sims)] <- NA
+  a <- (1 - nivel) / 2
+  data.frame(
+    h   = seq_len(H),
+    inf = apply(sims, 1, quantile, probs = a,     na.rm = TRUE),
+    sup = apply(sims, 1, quantile, probs = 1 - a, na.rm = TRUE)
+  )
+}
+
+ic_lista <- list(
+  "SARIMA" = data.frame(
+    h = 1:H,
+    inf = pred_sarima - 1.96 * as.numeric(previsao_sarima$se),
+    sup = pred_sarima + 1.96 * as.numeric(previsao_sarima$se)
+  ),
+  "Embedding — Completo" = ic_bootstrap(modelo_emb_completo, X_treino, Y_treino,
+                                        H, "lm", residuos = res_completo),
+  "Embedding — Lags Signif." = ic_bootstrap(modelo_emb_sig, X_sig, Y_treino,
+                                            H, "lm", residuos = res_sig),
+  "Embedding — LASSO" = ic_bootstrap(modelo_lasso, X_mat_lasso, Y_vec_lasso,
+                                     H, "lasso", lambda_val = lambda_otimo,
+                                     residuos = res_lasso_ic),
+  "Embedding — Ridge" = ic_bootstrap(modelo_ridge, X_mat_ridge, Y_vec_ridge,
+                                     H, "lasso", lambda_val = lambda_otimo_ridge,
+                                     residuos = res_ridge),
+  "Embedding — Elastic Net" = ic_bootstrap(modelo_elastic, X_mat_elastic, Y_vec_elastic,
+                                           H, "lasso", lambda_val = lambda_otimo_elastic,
+                                           residuos = res_elastic)
+)
+
+preds_lista <- list(
+  "SARIMA" = pred_sarima,
+  "Embedding — Completo" = pred_emb_completo,
+  "Embedding — Lags Signif." = pred_emb_sig,
+  "Embedding — LASSO" = pred_emb_lasso,
+  "Embedding — Ridge" = pred_emb_ridge,
+  "Embedding — Elastic Net" = pred_emb_elastic
+)
+
+# Cobertura: quantos dos H pontos de teste caem dentro do intervalo
+cobertura <- data.frame(
+  Modelo = names(ic_lista),
+  Cobertura = sapply(names(ic_lista), function(nm)
+    mean(teste >= ic_lista[[nm]]$inf & teste <= ic_lista[[nm]]$sup)),
+  Largura_media = sapply(ic_lista, function(d) mean(d$sup - d$inf))
+)
+rownames(cobertura) <- NULL
+knitr::kable(cobertura, digits = 2, booktabs = TRUE,
+             caption = "Cobertura empírica e largura média dos intervalos de 95%")
+write.csv(cobertura, file.path(dir_figuras, "cobertura_ic.csv"), row.names = FALSE)
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+
+t_fut <- as.numeric(time(ts(teste, start = end(Residencial_treino) + c(0, 1), frequency = 12)))
+df_obs <- data.frame(t = as.numeric(time(Residencial)), y = as.numeric(Residencial))
+
+df_ic <- dplyr::bind_rows(lapply(names(ic_lista), function(nm)
+  data.frame(t = t_fut, pred = preds_lista[[nm]],
+             inf = ic_lista[[nm]]$inf, sup = ic_lista[[nm]]$sup, Modelo = nm)))
+df_ic$Modelo <- factor(df_ic$Modelo, levels = names(ic_lista))
+
+faixa_y <- range(df_obs$y[df_obs$t >= 2022]) * c(0.75, 1.25)
+
+grafico_ic <- ggplot() +
+  geom_ribbon(data = df_ic, aes(t, ymin = inf, ymax = sup),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(data = df_obs, aes(t, y), color = "black", linewidth = 0.6) +
+  geom_line(data = df_ic, aes(t, pred), color = "firebrick", linewidth = 0.9) +
+  facet_wrap(~ Modelo, ncol = 2) +
+  coord_cartesian(xlim = c(2022, 2026.2), ylim = faixa_y) +
+  labs(x = "Ano", y = "Consumo Residencial (GWh)") +
+  theme_minimal()
+grafico_ic
+
+ggsave(file.path(dir_figuras, "12b_comparativo_com_ic.png"),
+       grafico_ic, width = 12, height = 8, dpi = 300)
+```
+
+## Gráfico Comparativo
+
+```{r}
+#| fig-width: 12
+#| fig-height: 5
+
+ts_sarima    <- ts(pred_sarima,       start = end(Residencial_treino) + c(0,1), frequency = 12)
+ts_completo  <- ts(pred_emb_completo, start = end(Residencial_treino) + c(0,1), frequency = 12)
+ts_sig       <- ts(pred_emb_sig,      start = end(Residencial_treino) + c(0,1), frequency = 12)
+ts_lasso     <- ts(pred_emb_lasso,    start = end(Residencial_treino) + c(0,1), frequency = 12)
+ts_ridge     <- ts(pred_emb_ridge,    start = end(Residencial_treino) + c(0,1), frequency = 12)
+ts_elastic   <- ts(pred_emb_elastic,    start = end(Residencial_treino) + c(0,1), frequency = 12)
+
+
+
+grafico_comparativo <- autoplot(Residencial, series = "Observado") +
+  autolayer(ts_sarima,   series = "SARIMA",               linewidth = 1.0) +
+  autolayer(ts_completo, series = "Embedding — Completo", linewidth = 0.8, linetype = "dashed") +
+  autolayer(ts_sig,      series = "Embedding — Sig.",     linewidth = 0.8, linetype = "dotted") +
+  autolayer(ts_lasso,    series = "Embedding — LASSO",    linewidth = 1.0) +
+  autolayer(ts_ridge,    series = "Embedding — RIDGE",    linewidth = 1.0) +
+  autolayer(ts_elastic,  series = "Embedding — ElasticNet",    linewidth = 1.0) +
+  coord_cartesian(xlim = c(2022, 2026.2)) +
+  labs(
+    x     = "Ano",
+    y     = "Consumo Residencial (GWh)",
+    color = "Séries"
+  ) +
+  scale_color_manual(values = c(
+    "Observado"             = "black",
+    "SARIMA"                = "firebrick",
+    "Embedding — Completo"  = "darkorange",
+    "Embedding — Sig."      = "goldenrod3",
+    "Embedding — LASSO"     = "steelblue",
+    "Embedding — RIDGE"     = "magenta",
+    "Embedding — ElasticNet"  = "green"
+  )) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+grafico_comparativo
+
+ggsave(file.path(dir_figuras, "12_comparativo_geral.png"),
+       grafico_comparativo, width = 12, height = 5, dpi = 300)
+
+cat("\n=== Todas as figuras foram salvas em:", dir_figuras, "===\n")
+```
+
+## Resíduos: FAC de cada modelo
+
+Resíduos do ajuste de 1 passo no treino (no SARIMA, sem as 12 primeiras observações, que não são informativas por causa da diferença sazonal). As linhas tracejadas são o intervalo de ±1,96/√n.
+
+```{r}
+#| fig-width: 12
+#| fig-height: 11
+
+res_lasso_acf <- as.numeric(
+  Y_vec_lasso - predict(modelo_lasso, newx = X_mat_lasso, s = lambda_otimo)
+)
+residuos_acf <- list(
+  "SARIMA"                          = as.numeric(residuos_sarima)[-(1:12)],
+  "Embedding — Completo (MQO)"      = as.numeric(residuals(modelo_emb_completo)),
+  "Embedding — Lags Significativos" = as.numeric(residuals(modelo_emb_sig)),
+  "Embedding — LASSO"               = res_lasso_acf,
+  "Embedding — Ridge"               = as.numeric(res_ridge),
+  "Embedding — Elastic Net"         = as.numeric(res_elastic)
+)
+
+df_acf_res <- dplyr::bind_rows(lapply(names(residuos_acf), function(nm) {
+  r <- residuos_acf[[nm]]
+  a <- acf(r, lag.max = 36, plot = FALSE)
+  data.frame(Modelo = nm, lag = as.numeric(a$lag)[-1], acf = as.numeric(a$acf)[-1],
+             banda = qnorm(0.975) / sqrt(length(r)))
+}))
+df_acf_res$Modelo <- factor(df_acf_res$Modelo, names(residuos_acf))
+
+grafico_acf_res <- ggplot(df_acf_res, aes(lag, acf)) +
+  geom_hline(yintercept = 0) +
+  geom_segment(aes(xend = lag, yend = 0), linewidth = 0.5) +
+  geom_hline(aes(yintercept =  banda), linetype = "dashed", color = "#4C72B0") +
+  geom_hline(aes(yintercept = -banda), linetype = "dashed", color = "#4C72B0") +
+  facet_wrap(~ Modelo, ncol = 2) +
+  labs(x = "Defasagem (meses)", y = "FAC dos resíduos") +
+  theme_minimal()
+grafico_acf_res
+ggsave(file.path(dir_figuras, "17_acf_residuos_variantes.png"),
+       grafico_acf_res, width = 12, height = 11, dpi = 200)
+
+# fração de defasagens fora da banda, por modelo
+print(round(tapply(abs(df_acf_res$acf) > df_acf_res$banda, df_acf_res$Modelo, mean), 3))
+```
+
+------------------------------------------------------------------------
+
+# Exportação dos resultados para a monografia
+
+Rodar por último. Gera as figuras que faltavam, as tabelas em LaTeX (`tabelas/`), os CSVs das grades e um `.zip` único para envio.
+
+```{r}
+# ============================================================
+# EXPORTAÇÃO — SÉRIE REAL
+# ============================================================
+dir_tabelas <- here("tabelas")
+if (!dir.exists(dir_tabelas)) dir.create(dir_tabelas, recursive = TRUE)
+
+# --- formatadores (vírgula decimal, \, como separador de milhar) ---
+fmt <- function(x, d = 2) {
+  ifelse(is.na(x), "--",
+         formatC(x, format = "f", digits = d, big.mark = ".", decimal.mark = ","))
+}
+tabular_tex <- function(df, arquivo, align) {
+  tex <- knitr::kable(df, format = "latex", booktabs = TRUE, escape = FALSE,
+                      align = align, row.names = FALSE, linesep = "")
+  writeLines(as.character(tex), file.path(dir_tabelas, arquivo))
+}
+eqmp <- function(p) mean((teste - p)^2)
+
+# --- nº de lags efetivamente ativos em cada variante ---
+n_ativos <- function(modelo, s) {
+  cf <- as.numeric(coef(modelo, s = s))[-1]
+  sum(cf != 0)
+}
+
+# --- Tabela 1: hiperparâmetros selecionados + EQMP validação/teste ---
+tab_hiper <- data.frame(
+  Modelo = c("SARIMA", "Embedding -- MQO", "Embedding -- Lags signif.",
+             "Embedding -- LASSO", "Embedding -- Ridge", "Embedding -- Elastic Net"),
+  tau    = c(NA, tau_emb, tau_emb, tau_lasso, tau_ridge, tau_elastic),
+  m      = c(NA, m_emb,   m_emb,   m_lasso,   m_ridge,   m_elastic),
+  Lags   = c(NA, m_emb - 1, length(lags_sig),
+             n_ativos(modelo_lasso,   lambda_otimo),
+             n_ativos(modelo_ridge,   lambda_otimo_ridge),
+             n_ativos(modelo_elastic, lambda_otimo_elastic)),
+  EQMP_val = c(NA, melhor_emb$EQMP, NA, melhor_lasso$EQMP,
+               melhor_ridge$EQMP, melhor_elastic$EQMP),
+  EQMP_teste = c(eqmp(pred_sarima), eqmp(pred_emb_completo), eqmp(pred_emb_sig),
+                 eqmp(pred_emb_lasso), eqmp(pred_emb_ridge), eqmp(pred_emb_elastic))
+)
+var_teste <- mean((teste - mean(teste))^2)
+tab_hiper$EQMP_pct <- 100 * tab_hiper$EQMP_teste / var_teste
+tab_hiper <- tab_hiper[order(tab_hiper$EQMP_teste), ]
+tab_hiper_tex <- data.frame(
+  Modelo = tab_hiper$Modelo,
+  `$\\tau$` = ifelse(is.na(tab_hiper$tau), "--", tab_hiper$tau),
+  `$m$` = ifelse(is.na(tab_hiper$m), "--", tab_hiper$m),
+  `Lags ativos` = ifelse(is.na(tab_hiper$Lags), "--", tab_hiper$Lags),
+  `EQMP (validação)` = fmt(tab_hiper$EQMP_val, 1),
+  `EQMP (teste)` = fmt(tab_hiper$EQMP_teste, 1),
+  `EQMP (\\%)` = fmt(tab_hiper$EQMP_pct, 1),
+  check.names = FALSE
+)
+tabular_tex(tab_hiper_tex, "tab_eqmp.tex", c("l", "c", "c", "c", "r", "r", "r"))
+
+# --- Tabela 2: previsões ---
+tab_prev <- tabela_previsoes
+nomes_prev <- c("Data", "Real", "SARIMA", "MQO", "Signif.", "LASSO", "Ridge", "E.Net")
+tab_prev_tex <- tab_prev
+for (j in 2:ncol(tab_prev_tex)) tab_prev_tex[[j]] <- fmt(tab_prev[[j]], 1)
+names(tab_prev_tex) <- nomes_prev
+tabular_tex(tab_prev_tex, "tab_previsoes.tex", c("l", rep("r", 7)))
+
+# --- CSVs das grades (para análise posterior) ---
+write.csv(tabela_cv_emb,     file.path(dir_figuras, "grade_mqo.csv"),     row.names = FALSE)
+write.csv(tabela_cv_lasso,   file.path(dir_figuras, "grade_lasso.csv"),   row.names = FALSE)
+write.csv(tabela_cv_ridge,   file.path(dir_figuras, "grade_ridge.csv"),   row.names = FALSE)
+write.csv(tabela_cv_elastic, file.path(dir_figuras, "grade_elastic.csv"), row.names = FALSE)
+
+# --- Heatmaps da seleção (escala log10; instáveis em cinza) ---
+heatmap_cv <- function(tab, tau_sel, m_sel, arquivo) {
+  tab$logEQMP <- ifelse(is.finite(tab$EQMP) & tab$EQMP > 0, log10(tab$EQMP), NA_real_)
+  g <- ggplot(tab, aes(x = m, y = tau, fill = logEQMP)) +
+    geom_tile(color = "white") +
+    geom_point(data = tab[tab$tau == tau_sel & tab$m == m_sel, ],
+               shape = 21, size = 4, fill = NA, stroke = 1.2) +
+    scale_fill_viridis_c(na.value = "grey85", direction = -1) +
+    scale_y_continuous(breaks = unique(tab$tau)) +
+    labs(x = expression("Dimensão do embedding ("*m*")"),
+         y = expression("Atraso temporal ("*tau*")"),
+         fill = expression(log[10]("EQMP val."))) +
+    theme_minimal() + theme(legend.position = "bottom")
+  ggsave(file.path(dir_figuras, arquivo), g, width = 7, height = 4, dpi = 300)
+  invisible(g)
+}
+heatmap_cv(tabela_cv_emb,     tau_emb,     m_emb,     "cv_tau_m_embedding.png")
+heatmap_cv(tabela_cv_lasso,   tau_lasso,   m_lasso,   "cv_tau_m_lasso.png")
+heatmap_cv(tabela_cv_ridge,   tau_ridge,   m_ridge,   "cv_tau_m_ridge.png")
+heatmap_cv(tabela_cv_elastic, tau_elastic, m_elastic, "cv_tau_m_elastic.png")
+
+# --- FAC/FACP dos resíduos das variantes penalizadas ---
+res_lasso <- as.numeric(Y_vec_lasso - predict(modelo_lasso, newx = X_mat_lasso, s = lambda_otimo))
+salvar_acf <- function(res, titulo, arquivo, lag_max) {
+  png(file.path(dir_figuras, arquivo), width = 12, height = 5, units = "in", res = 300)
+  par(mfrow = c(1, 2))
+  acf(as.numeric(res),  lag.max = lag_max, main = paste("FAC dos Resíduos —", titulo))
+  pacf(as.numeric(res), lag.max = lag_max, main = paste("FACP dos Resíduos —", titulo))
+  par(mfrow = c(1, 1)); dev.off()
+}
+salvar_acf(res_lasso,   "LASSO",       "13_lasso_acf_pacf_residuos.png",   max(36, m_lasso - 1))
+salvar_acf(res_ridge,   "Ridge",       "14_ridge_acf_pacf_residuos.png",   max(36, m_ridge - 1))
+salvar_acf(res_elastic, "Elastic Net", "15_elastic_acf_pacf_residuos.png", max(36, m_elastic - 1))
+
+# --- Resumo em texto + RDS + ZIP ---
+sink(file.path(dir_figuras, "resumo_resultados.txt"))
+cat("=== RESUMO — SÉRIE REAL ===\n"); print(tab_hiper)
+cat("\nTeste:", teste, "\n")
+cat("\nCoef. LASSO não nulos:\n");   print(df_coef_lasso)
+cat("\nCoef. Elastic Net não nulos:\n"); print(df_coef_elastic[df_coef_elastic$Coeficiente != 0, ])
+cat("\nLags significativos (MQO):", lags_sig, "\n")
+cat("\nInstáveis por motivo (MQO):\n");   print(table(tabela_cv_emb$motivo))
+cat("Instáveis por motivo (LASSO):\n");   print(table(tabela_cv_lasso$motivo))
+cat("Instáveis por motivo (Ridge):\n");   print(table(tabela_cv_ridge$motivo))
+cat("Instáveis por motivo (E.Net):\n");   print(table(tabela_cv_elastic$motivo))
+cat("\nTop-10 combinações MQO (validação):\n"); print(head(tabela_validos_emb, 10))
+cat("\nLjung-Box SARIMA lag 12 / 24, Shapiro:\n")
+print(Box.test(residuos_sarima, lag = 12, type = "Ljung-Box"))
+print(Box.test(residuos_sarima, lag = 24, type = "Ljung-Box"))
+print(shapiro.test(residuos_sarima))
+cat("\n"); print(sessionInfo())
+sink()
+
+saveRDS(list(teste = teste, preds = tabela_previsoes, hiper = tab_hiper,
+             grade_mqo = tabela_cv_emb, grade_lasso = tabela_cv_lasso,
+             grade_ridge = tabela_cv_ridge, grade_elastic = tabela_cv_elastic),
+        file.path(dir_figuras, "resultados_v9.rds"))
+
+arquivos <- c(list.files(dir_figuras, full.names = TRUE),
+              list.files(dir_tabelas, full.names = TRUE))
+# --- Conferência final: tudo foi gerado hoje? ---
+esperados <- c("01_serie_completa.png","02_acf_pacf_original.png",
+  "03_acf_pacf_diferenciada.png","04_sarima_diagnostico.png",
+  "05_sarima_acf_pacf_residuos.png","06_sarima_previsao.png",
+  "07_embedding_completo_acf_pacf_residuos.png",
+  "08_embedding_significativo_acf_pacf_residuos.png",
+  "11_erro_quadratico_por_horizonte.png","12_comparativo_geral.png",
+  "12b_comparativo_com_ic.png","cobertura_ic.csv","16_ajuste_e_previsao_variantes.png","17_acf_residuos_variantes.png",
+  "13_lasso_acf_pacf_residuos.png","14_ridge_acf_pacf_residuos.png",
+  "15_elastic_acf_pacf_residuos.png","cv_tau_m_embedding.png",
+  "cv_tau_m_lasso.png","cv_tau_m_ridge.png","cv_tau_m_elastic.png")
+faltando <- setdiff(esperados, list.files(dir_figuras))
+arqs <- list.files(dir_figuras, full.names = TRUE)
+velhos <- basename(arqs)[as.Date(file.info(arqs)$mtime) < Sys.Date()]
+cat("\n=== CONFERÊNCIA ===\n")
+cat("Pasta:", normalizePath(dir_figuras), "\n")
+cat("Faltando:", if (length(faltando)) paste(faltando, collapse = ", ") else "nada", "\n")
+cat("Não atualizados hoje:", if (length(velhos)) paste(velhos, collapse = ", ") else "nenhum", "\n\n")
+
+arq_zip <- here("resultados_serie_real.zip")
+if (requireNamespace("zip", quietly = TRUE)) {
+  zip::zip(arq_zip, arquivos, mode = "cherry-pick")
+} else {
+  utils::zip(arq_zip, arquivos, flags = "-jq")   # exige o Rtools no Windows
+}
+cat("\nArquivos exportados em:", dir_figuras, "e", dir_tabelas, "\n")
+cat(if (file.exists(arq_zip)) paste("ZIP criado:", arq_zip) else
+    "ZIP não foi criado: instale o pacote 'zip' ou compacte as pastas manualmente.", "\n")
+
+```
+
+```{r}
+s   <- (1:30)^2
+d   <- build_embedding_matrix(s, tau = 1, m = 3)
+mod <- lm(d$Y ~ ., data = as.data.frame(d$X))
+previsao_recursiva(mod, d$X, s, H = 3, tipo = "lm")
+# correto: 961 1024 1089    |  se aparecer 900 961 902, o bug existe
+```
+
+```{r}
+# Sessão completa salva: dá para reabrir depois com load() sem rodar tudo de novo
+save.image(here("sessao_serie_real_final.RData"))
+cat("Sessão final salva:", format(Sys.time()), "\n")
+```
