@@ -1,0 +1,94 @@
+=== RESUMO — HENON ===
+n_obs = 5000  H = 200  grade tau: 1 50  grade m: 1 100 
+
+                           Modelo tau  m Lags   EQMP_val EQMP_teste  EQMP_pct
+1      Embedding — Completo (MQO)   1 53   52 0.04155682 0.05403140  9.995817
+2               Embedding — LASSO   1 53   52 0.04173518 0.05443793 10.071027
+3         Embedding — Elastic Net   1 53   51 0.04167500 0.05451941 10.086100
+4 Embedding — Lags Significativos   1 53   26         NA 0.05467420 10.114737
+5               Embedding — Ridge   1 53   52 0.05738491 0.06690708 12.377821
+6           Embedding — AMI + Cao   8 13   12         NA 0.12312405 22.777970
+7           Embedding — ACF + Cao   1  3    2         NA 0.17878436 33.075137
+
+Cobertura dos IC:
+                           Modelo Cobertura Largura_media
+1      Embedding — Completo (MQO)     0.925     0.9023630
+2 Embedding — Lags Significativos     0.930     0.9060680
+3               Embedding — LASSO     0.935     0.9017246
+4               Embedding — Ridge     0.950     0.8840586
+5         Embedding — Elastic Net     0.935     0.9023722
+6           Embedding — AMI + Cao     0.935     1.2582620
+7           Embedding — ACF + Cao     0.940     1.3680777
+
+Motivos de descarte (MQO):
+
+       falha_embedding         falha_previsao historico_insuficiente                     ok 
+                    50                    907                     20                   4023 
+Motivos de descarte (LASSO):
+
+       falha_embedding historico_insuficiente   nenhum_lambda_valido                     ok 
+                    50                     20                    957                   3973 
+Motivos de descarte (Ridge):
+
+       falha_embedding historico_insuficiente   nenhum_lambda_valido                     ok 
+                    50                     20                    957                   3973 
+Motivos de descarte (E.Net):
+
+       falha_embedding historico_insuficiente   nenhum_lambda_valido                     ok 
+                    50                     20                    957                   3973 
+
+Top-10 MQO (validação):
+# A tibble: 10 × 6
+     tau     m   EQMP estavel lambda motivo
+   <int> <int>  <dbl> <lgl>    <dbl> <chr> 
+ 1     1    53 0.0416 TRUE        NA ok    
+ 2     1    54 0.0418 TRUE        NA ok    
+ 3     1    39 0.0421 TRUE        NA ok    
+ 4     1    60 0.0421 TRUE        NA ok    
+ 5     1    61 0.0422 TRUE        NA ok    
+ 6     1    59 0.0422 TRUE        NA ok    
+ 7     1    52 0.0422 TRUE        NA ok    
+ 8     1    63 0.0422 TRUE        NA ok    
+ 9     1    43 0.0422 TRUE        NA ok    
+10     1    62 0.0422 TRUE        NA ok    
+
+Regime usado: a = 1.12, b = 0,3; n.transient = 500; semente 123; n = 5000; H = 200 
+
+R version 4.6.0 (2026-04-24 ucrt)
+Platform: x86_64-w64-mingw32/x64
+Running under: Windows 11 x64 (build 26200)
+
+Matrix products: default
+  LAPACK version 3.12.1
+
+locale:
+[1] LC_COLLATE=Portuguese_Brazil.utf8  LC_CTYPE=Portuguese_Brazil.utf8    LC_MONETARY=Portuguese_Brazil.utf8
+[4] LC_NUMERIC=C                       LC_TIME=Portuguese_Brazil.utf8    
+
+time zone: America/Sao_Paulo
+tzcode source: internal
+
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] see_0.14.2             performance_0.18.2     glmnet_5.1             Matrix_1.7-5          
+ [5] nonlinearTseries_0.3.2 lmtest_0.9-40          zoo_1.8-15             astsa_2.5             
+ [9] forecast_9.0.2         lubridate_1.9.5        forcats_1.0.1          stringr_1.6.0         
+[13] purrr_1.2.2            readr_2.2.0            tidyr_1.3.2            tibble_3.3.1          
+[17] ggplot2_4.0.3          tidyverse_2.0.0        dplyr_1.2.1            here_1.0.2            
+
+loaded via a namespace (and not attached):
+ [1] gtable_0.3.6       shape_1.4.6.1      xfun_0.59          insight_1.5.4      lattice_0.22-9    
+ [6] tzdb_0.5.0         quadprog_1.5-8     vctrs_0.7.3        tools_4.6.0        generics_0.1.4    
+[11] datawizard_1.4.0   curl_7.1.0         parallel_4.6.0     xts_0.14.2         pkgconfig_2.0.3   
+[16] RColorBrewer_1.1-3 S7_0.2.2           lifecycle_1.0.5    compiler_4.6.0     farver_2.1.2      
+[21] textshaping_1.0.5  codetools_0.2-20   htmltools_0.5.9    pillar_1.11.1      iterators_1.0.14  
+[26] foreach_1.5.2      nlme_3.1-169       fracdiff_1.5-4     digest_0.6.39      tidyselect_1.2.1  
+[31] zip_3.0.2          stringi_1.8.7      labeling_0.4.3     tseries_0.10-61    splines_4.6.0     
+[36] fastmap_1.2.0      rprojroot_2.1.1    grid_4.6.0         colorspace_2.1-2   cli_3.6.6         
+[41] magrittr_2.0.5     utf8_1.2.6         survival_3.8-6     withr_3.0.3        scales_1.4.0      
+[46] timechange_0.4.0   rmarkdown_2.31     TTR_0.24.4         quantmod_0.4.28    otel_0.2.0        
+[51] timeDate_4052.112  ragg_1.5.2         hms_1.1.4          urca_1.3-4         evaluate_1.0.5    
+[56] knitr_1.51         viridisLite_0.4.3  rlang_1.2.0        Rcpp_1.1.1-1.1     glue_1.8.1        
+[61] rstudioapi_0.19.0  R6_2.6.1           systemfonts_1.3.2 
