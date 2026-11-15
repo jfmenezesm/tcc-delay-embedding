@@ -24,7 +24,7 @@ Selecionamos hiperparâmetros (atraso τ, dimensão m e penalização λ) e comp
 
 ## Como executar
 
-1. Instale o R e o [Quarto](https://quarto.org).
+1. Instale o R.
 2. Instale os pacotes:
    ```r
    install.packages(c("astsa", "dplyr", "forecast", "ggplot2", "glmnet", "here",
